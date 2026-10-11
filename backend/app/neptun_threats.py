@@ -73,6 +73,104 @@ LAUNCH_BACK_KM: Dict[str, float] = {
     "unknown": 150.0,
 }
 
+# Dense ground-track resolution so NEPTUN arcs render exactly like the
+# simulator (curved ballistic sweep / S-weave for drones), not a 3-point
+# kink. The frontend adds the vertical lift on top (same altitude model).
+TRAJECTORY_POINTS = 48
+
+
+def _bezier_leg(
+    lat0: float, lon0: float, lat1: float, lon1: float,
+    n: int, amplitude: float,
+) -> List[Tuple[float, float]]:
+    """One quadratic-Bezier leg (ballistic ground-track curvature).
+
+    Same shape as geo_database.generate_curved_ballistic_arc, but for an
+    arbitrary leg so launch -> current -> dest stays continuous through
+    the observed position.
+    """
+    d_lat, d_lon = lat1 - lat0, lon1 - lon0
+    norm_len = math.hypot(-d_lon, d_lat)
+    if norm_len > 0:
+        n_lat, n_lon = -d_lon / norm_len, d_lat / norm_len
+    else:
+        n_lat, n_lon = 0.0, 0.0
+    if n_lat < 0:
+        n_lat, n_lon = -n_lat, -n_lon
+    mid_lat = (lat0 + lat1) / 2 + n_lat * amplitude
+    mid_lon = (lon0 + lon1) / 2 + n_lon * amplitude
+    pts: List[Tuple[float, float]] = []
+    for i in range(n):
+        t = i / float(max(n - 1, 1))
+        b_lat = (1 - t) ** 2 * lat0 + 2 * (1 - t) * t * mid_lat + t ** 2 * lat1
+        b_lon = (1 - t) ** 2 * lon0 + 2 * (1 - t) * t * mid_lon + t ** 2 * lon1
+        pts.append((b_lat, b_lon))
+    return pts
+
+
+def _weave_leg(
+    lat0: float, lon0: float, lat1: float, lon1: float,
+    n: int, weave_deg: float, weave_cycles: float, phase: float = 0.0,
+) -> List[Tuple[float, float]]:
+    """One linear leg with sinusoidal lateral S-weave (drones / cruise)."""
+    d_lat, d_lon = lat1 - lat0, lon1 - lon0
+    norm_len = math.hypot(d_lat, d_lon)
+    if norm_len > 0:
+        n_lat, n_lon = -d_lon / norm_len, d_lat / norm_len
+    else:
+        n_lat, n_lon = 0.0, 0.0
+    pts: List[Tuple[float, float]] = []
+    for i in range(n):
+        t = i / float(max(n - 1, 1))
+        lat = lat0 + (lat1 - lat0) * t
+        lon = lon0 + (lon1 - lon0) * t
+        if weave_deg > 0:
+            w = weave_deg * math.sin(2.0 * math.pi * weave_cycles * t + phase)
+            lat += n_lat * w
+            lon += n_lon * w
+        pts.append((lat, lon))
+    return pts
+
+
+def build_forward_trajectory(
+    current: Tuple[float, float],
+    dest: Tuple[float, float],
+    family: str,
+    speed_kmh: Optional[float] = None,
+    full_dist_km: float = 0.0,
+) -> List[List[float]]:
+    """Dense CURRENT -> DEST ground track (the future path only).
+
+    The flown leg (launch -> current) is reconstructed guesswork and, drawn
+    for every one of 20+ swarm tracks from the same launch area, turns the
+    map into unreadable spaghetti of giant triangles. The origin stays
+    visible via the launch marker. Shape mirrors the simulator: ballistic
+    Bezier sweep for BALLISTIC / MIG31K, short straight glide for KAB,
+    S-weave for SHAHED / cruise / recon.
+    """
+    n = TRAJECTORY_POINTS + 1
+    c_lat, c_lon = current
+    d_lat, d_lon = dest
+    fam = (family or "").upper()
+    is_jet = fam == "SHAHED" and speed_kmh is not None and speed_kmh >= 400
+    if fam in ("BALLISTIC", "MIG31K"):
+        amplitude = min(max(max(full_dist_km, 1.0) * 0.0035, 0.4), 1.8)
+        leg = _bezier_leg(c_lat, c_lon, d_lat, d_lon, n, amplitude)
+    elif fam == "KAB":
+        leg = _weave_leg(c_lat, c_lon, d_lat, d_lon, n, 0.0, 0.0)
+    else:
+        if is_jet or fam == "JET_SHAHED":
+            weave, cycles = 0.04, 1.2
+        elif fam == "CRUISE_MISSILE":
+            weave, cycles = 0.035, 1.5
+        elif fam in ("SHAHED", "FPV"):
+            weave, cycles = 0.09, 2.5
+        else:
+            weave, cycles = 0.05, 2.0
+        leg = _weave_leg(c_lat, c_lon, d_lat, d_lon, n, weave, cycles)
+
+    return [[round(la, 5), round(lo, 5)] for la, lo in leg]
+
 
 def _haversine(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     R = 6371.0
@@ -306,24 +404,25 @@ class NeptunThreatsService:
                         "lon": round(d_lon, 5),
                         "name": d_name,
                     }
-                    expected_trajectory = [
-                        [round(l_lat, 5), round(l_lon, 5)],
-                        [round(lat_f, 5), round(lon_f, 5)],
-                        [round(d_lat, 5), round(d_lon, 5)],
-                    ]
                 else:
                     # Extrapolate forward ~80km if no city matched
                     f_lat, f_lon = _dest_point(lat_f, lon_f, effective_bearing, 80.0)
+                    d_lat, d_lon, d_name = f_lat, f_lon, "Очікуваний сектор"
                     dest_info = {
                         "lat": round(f_lat, 5),
                         "lon": round(f_lon, 5),
-                        "name": "Очікуваний сектор",
+                        "name": d_name,
                     }
-                    expected_trajectory = [
-                        [round(l_lat, 5), round(l_lon, 5)],
-                        [round(lat_f, 5), round(lon_f, 5)],
-                        [round(f_lat, 5), round(f_lon, 5)],
-                    ]
+                # 3. Dense forward track (live fix -> dest) + flown fraction
+                # for the frontend altitude profile.
+                flown_km = _haversine(l_lat, l_lon, lat_f, lon_f)
+                remain_km = _haversine(lat_f, lon_f, d_lat, d_lon)
+                full_km = flown_km + remain_km
+                progress_base = (flown_km / full_km) if full_km > 0 else 0.0
+                expected_trajectory = build_forward_trajectory(
+                    (lat_f, lon_f), (d_lat, d_lon),
+                    TYPE_MAP.get(ntype, "UNKNOWN"), speed, full_km,
+                )
 
             out.append({
                 "id": str(t.get("id", "")),
@@ -352,6 +451,7 @@ class NeptunThreatsService:
                 "launch": launch_info,
                 "destination": dest_info,
                 "expectedTrajectory": expected_trajectory,
+                "progressBase": round(progress_base, 4) if effective_bearing is not None else None,
             })
         return out
 
