@@ -44,6 +44,7 @@ class MockSimulator:
             raw_text="Пуск баллистики с Брянской области! Направление: Черниговщина / Киев / Вышгород!",
             threat_level="CRITICAL",
             launcher_pos=origin.model_copy(deep=True),
+            is_simulated=True,
         )
 
         alert = TelegramAlert(
@@ -91,6 +92,7 @@ class MockSimulator:
             raw_text="Група ударних БпЛА з півдня (Чауда) через Миколаївщину курсом на Кіровоградщину/Умань!",
             threat_level="HIGH",
             launcher_pos=None,
+            is_simulated=True,
         )
 
         alert = TelegramAlert(
@@ -137,6 +139,7 @@ class MockSimulator:
             raw_text="Пуск крилатих ракет «Калібр» з акваторії Чорного моря! Курс на Кременчук.",
             threat_level="CRITICAL",
             launcher_pos=None,
+            is_simulated=True,
         )
 
         alert = TelegramAlert(
@@ -184,6 +187,7 @@ class MockSimulator:
             raw_text="Реактивні БпЛА (Shahed-238) з Приморсько-Ахтарська курсом на Дніпро! Швидкість ~550 км/год!",
             threat_level="CRITICAL",
             launcher_pos=None,
+            is_simulated=True,
         )
 
         alert = TelegramAlert(
@@ -235,6 +239,7 @@ class MockSimulator:
             raw_text="Пуск КАБ з борту Су-34 над Бєлгородщиною! Напрямок: Харків!",
             threat_level="HIGH",
             launcher_pos=None,
+            is_simulated=True,
         )
 
         alert = TelegramAlert(
@@ -256,6 +261,8 @@ class MockSimulator:
         now = time.time()
         result = ThreatParser.process_message(text, channel=channel)
         primary = result.get("primary")
+        if primary:
+            primary.is_simulated = True
         alert = TelegramAlert(
             id=str(uuid.uuid4())[:8],
             channel=channel,

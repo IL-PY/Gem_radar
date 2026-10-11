@@ -16,7 +16,7 @@ export const App: React.FC = () => {
   const [wsConnected, setWsConnected] = useState<boolean>(false);
   const [soundEnabled, setSoundEnabled] = useState<boolean>(true);
   const [isAlertsOpen, setIsAlertsOpen] = useState<boolean>(false);
-  const [isSimulatorOpen, setIsSimulatorOpen] = useState<boolean>(true);
+  const [isSimulatorOpen, setIsSimulatorOpen] = useState<boolean>(false);
   const [viewMode, setViewMode] = useState<'2D' | '3D'>('3D');
 
   const wsRef = useRef<WebSocket | null>(null);

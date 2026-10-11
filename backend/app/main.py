@@ -27,6 +27,14 @@ class ConnectionManager:
     def disconnect(self, websocket: WebSocket):
         if websocket in self.active_connections:
             self.active_connections.remove(websocket)
+        # Simulation targets do not persist across sessions: when last client leaves, purge simulated targets
+        if not self.active_connections:
+            sim_tids = [
+                tid for tid, t in engine.active_targets.items()
+                if getattr(t, "is_simulated", False) or t.source_channel in ("@test_alerts", "@test_channel", "@manual_input")
+            ]
+            for tid in sim_tids:
+                engine.remove_target(tid)
 
     async def broadcast(self, message: dict):
         text_data = json.dumps(message)

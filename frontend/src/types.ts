@@ -27,6 +27,7 @@ export interface RadarTarget {
   raw_text: string;
   threat_level: 'CRITICAL' | 'HIGH' | 'MEDIUM';
   launcher_pos?: GeoPoint | null;
+  is_simulated?: boolean;
 }
 
 export interface TelegramAlert {

@@ -44,6 +44,7 @@ class RadarTarget(BaseModel):
     threat_level: str = "HIGH"            # CRITICAL, HIGH, MEDIUM
     confidence: float = 1.0             # 1.0 confirmed launch, 0.5 probable/unconfirmed
     launcher_pos: Optional[GeoPoint] = None # Coords for SPUs/MLRS launchers on map
+    is_simulated: bool = False          # Flag for mock simulator targets (not persisted)
 
 class TelegramAlert(BaseModel):
     id: str
