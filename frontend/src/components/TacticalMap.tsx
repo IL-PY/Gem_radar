@@ -134,6 +134,9 @@ export interface NeptunThreat {
   advisory: boolean;
   areaOnly: boolean;
   explanation: string;
+  launch?: { lat: number; lon: number; name: string } | null;
+  destination?: { lat: number; lon: number; name: string } | null;
+  expectedTrajectory?: number[][];
 }
 
 /** Great-circle destination point. */
@@ -202,8 +205,44 @@ export const TacticalMap: React.FC<TacticalMapProps> = ({
   const showNeptunRef = useRef<boolean>(true);
   // NEPTUN live threat tracks (points with heading, dead-reckoned per frame).
   const neptunRef = useRef<NeptunThreat[]>([]);
-  const neptunLiveRef = useRef<Map<string, { marker: maplibregl.Marker; sig: string }>>(new Map());
+  const neptunLiveRef = useRef<Map<string, {
+    marker: maplibregl.Marker;
+    launchMarker?: maplibregl.Marker;
+    destMarker?: maplibregl.Marker;
+    sig: string;
+  }>>(new Map());
   const [neptunMeta, setNeptunMeta] = useState<{ count: number; active: number; updatedAt: number } | null>(null);
+
+  // Push NEPTUN trajectories GeoJSON lines to map
+  const pushNeptunTrajectories = () => {
+    const map = mapRef.current;
+    if (!map) return;
+    try {
+      const src = map.getSource('neptun-trajectories') as maplibregl.GeoJSONSource | undefined;
+      if (!src) return;
+      const features: any[] = [];
+      neptunRef.current.forEach((t) => {
+        if (t.status !== 'active' || t.areaOnly) return;
+        const color = t.family === 'BALLISTIC' ? '#f43f5e' : t.family === 'CRUISE_MISSILE' ? '#38bdf8' : '#f59e0b';
+        if (t.expectedTrajectory && t.expectedTrajectory.length >= 2) {
+          features.push({
+            type: 'Feature',
+            properties: { id: `nt-traj-${t.id}`, color },
+            geometry: {
+              type: 'LineString',
+              coordinates: t.expectedTrajectory.map((pt) => [pt[1], pt[0]]),
+            },
+          });
+        }
+      });
+      src.setData({
+        type: 'FeatureCollection',
+        features,
+      });
+    } catch (e) {
+      console.warn('[Map] neptun trajectory push failed', e);
+    }
+  };
 
   // Marching-ants dash animation state for low-altitude trajectories.
   const dashOffRef = useRef(0);
@@ -353,17 +392,22 @@ export const TacticalMap: React.FC<TacticalMapProps> = ({
     neptunLiveRef.current.forEach((rec, id) => {
       if (!seen.has(id)) {
         rec.marker.remove();
+        rec.launchMarker?.remove();
+        rec.destMarker?.remove();
         neptunLiveRef.current.delete(id);
       }
     });
+
     neptunRef.current.forEach((t) => {
       const sk = neptunSkin(t.family);
       const stale = t.status !== 'active';
-      const sig = `${t.family}|${t.status}|${t.advisory ? 1 : 0}|${t.count}|${t.areaOnly ? 1 : 0}`;
+      const sig = `${t.family}|${t.status}|${t.advisory ? 1 : 0}|${t.count}|${t.areaOnly ? 1 : 0}|${t.launch?.name || ''}|${t.destination?.name || ''}`;
       const prev = neptunLiveRef.current.get(t.id);
       if (prev) {
         if (prev.sig === sig) return;
         prev.marker.remove();
+        prev.launchMarker?.remove();
+        prev.destMarker?.remove();
         neptunLiveRef.current.delete(t.id);
       }
       const el = document.createElement('div');
@@ -373,7 +417,10 @@ export const TacticalMap: React.FC<TacticalMapProps> = ({
       try {
         upd = t.updatedAt ? ` · ${new Date(t.updatedAt).toLocaleTimeString('uk-UA', { hour: '2-digit', minute: '2-digit' })}` : '';
       } catch { /* ignore */ }
-      const tip = `${t.title || t.family}${place ? ` · ${place}` : ''}${t.count > 1 ? ` · ×${t.count}` : ''}${t.explanation ? ` — ${t.explanation}` : ''}${upd} · NEPTUN`;
+      const targetCityText = t.destination?.name ? ` ➔ Ціль: ${t.destination.name}` : '';
+      const launchText = t.launch?.name ? ` [Пуск: ${t.launch.name}]` : '';
+      const tip = `${t.title || t.family}${launchText}${targetCityText}${place ? ` · ${place}` : ''}${t.count > 1 ? ` · ×${t.count}` : ''}${t.explanation ? ` — ${t.explanation}` : ''}${upd} · NEPTUN`;
+
       if (t.areaOnly) {
         // Docs forbid drawing areaOnly as a place: hollow outline + region label.
         el.innerHTML = `
@@ -392,12 +439,54 @@ export const TacticalMap: React.FC<TacticalMapProps> = ({
             ${t.count > 1 ? `<div class="absolute -bottom-1 -right-1 px-1 rounded bg-black/85 border border-slate-500 font-mono text-[9px] text-white font-bold">×${t.count}</div>` : ''}
           </div>`;
       }
+
+      let marker: maplibregl.Marker;
+      let launchMarker: maplibregl.Marker | undefined;
+      let destMarker: maplibregl.Marker | undefined;
+
       try {
         const p = predictNeptun(t, Date.now());
-        const marker = new maplibregl.Marker({ element: el }).setLngLat([p.lon, p.lat]).addTo(map);
-        neptunLiveRef.current.set(t.id, { marker, sig });
+        marker = new maplibregl.Marker({ element: el }).setLngLat([p.lon, p.lat]).addTo(map);
+
+        // Add launch origin marker if available
+        if (t.launch && !t.areaOnly && t.status === 'active') {
+          const lEl = document.createElement('div');
+          lEl.className = 'pointer-events-none select-none flex flex-col items-center';
+          lEl.innerHTML = `
+            <div class="flex items-center space-x-1 px-1.5 py-0.5 rounded bg-black/85 border border-red-500/60 shadow text-[9px] font-mono text-red-300 whitespace-nowrap">
+              <span class="w-1.5 h-1.5 rounded-full bg-red-500 animate-ping"></span>
+              <span>ПУСК: ${t.launch.name}</span>
+            </div>
+            <div class="w-1.5 h-1.5 rounded-full bg-red-500 border border-white mt-0.5"></div>
+          `;
+          launchMarker = new maplibregl.Marker({ element: lEl })
+            .setLngLat([t.launch.lon, t.launch.lat])
+            .addTo(map);
+        }
+
+        // Add destination target city marker if available
+        if (t.destination && !t.areaOnly && t.status === 'active') {
+          const dEl = document.createElement('div');
+          dEl.className = 'pointer-events-none select-none flex flex-col items-center';
+          dEl.innerHTML = `
+            <div class="relative flex items-center justify-center w-5 h-5">
+              <div class="absolute inset-0 rounded-full border border-sky-400/80 animate-ping"></div>
+              <div class="w-2.5 h-2.5 rounded-full border-2 border-sky-400 bg-sky-500/30"></div>
+            </div>
+            <div class="px-1 py-0.2 rounded bg-black/85 border border-sky-500/60 text-[9px] font-mono text-sky-300 font-bold whitespace-nowrap -mt-0.5">
+              ЦІЛЬ: ${t.destination.name}
+            </div>
+          `;
+          destMarker = new maplibregl.Marker({ element: dEl })
+            .setLngLat([t.destination.lon, t.destination.lat])
+            .addTo(map);
+        }
+
+        neptunLiveRef.current.set(t.id, { marker, launchMarker, destMarker, sig });
       } catch { /* map torn down */ }
     });
+
+    pushNeptunTrajectories();
   };
 
   // 1. Initialize MapLibre GL
@@ -428,6 +517,13 @@ export const TacticalMap: React.FC<TacticalMapProps> = ({
             data: '/borders.geojson',
           },
           'active-trajectories': {
+            type: 'geojson',
+            data: {
+              type: 'FeatureCollection',
+              features: [],
+            },
+          },
+          'neptun-trajectories': {
             type: 'geojson',
             data: {
               type: 'FeatureCollection',
@@ -551,6 +647,37 @@ export const TacticalMap: React.FC<TacticalMapProps> = ({
               'line-width': ['coalesce', ['get', 'coreWidth'], 3],
               'line-opacity': ['coalesce', ['get', 'coreOpacity'], 1.0],
               'line-dasharray': [1, 0],
+            },
+          },
+          // NEPTUN expected trajectories (dashed tactical vector)
+          {
+            id: 'neptun-trajectories-glow-layer',
+            type: 'line',
+            source: 'neptun-trajectories',
+            layout: {
+              'line-cap': 'round',
+              'line-join': 'round',
+            },
+            paint: {
+              'line-color': ['get', 'color'],
+              'line-width': 6,
+              'line-blur': 3,
+              'line-opacity': 0.45,
+            },
+          },
+          {
+            id: 'neptun-trajectories-core-layer',
+            type: 'line',
+            source: 'neptun-trajectories',
+            layout: {
+              'line-cap': 'round',
+              'line-join': 'round',
+            },
+            paint: {
+              'line-color': ['get', 'color'],
+              'line-width': 2.2,
+              'line-opacity': 0.85,
+              'line-dasharray': [3, 2],
             },
           },
         ],

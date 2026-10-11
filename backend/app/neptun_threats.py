@@ -12,9 +12,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import time
 import urllib.request
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 NEPTUN_THREATS_URL = "https://neptun.in.ua/api/v1/threats"
 POLL_INTERVAL_SEC = 10
@@ -31,6 +32,147 @@ TYPE_MAP = {
     "mig31k": "MIG31K",
     "unknown": "UNKNOWN",
 }
+
+# -----------------------------------------------------------------------
+# Large Ukrainian cities (pop > ~200 k) used for destination estimation.
+# -----------------------------------------------------------------------
+LARGE_CITIES: List[Tuple[float, float, str]] = [
+    (50.4501, 30.5234, "Київ"),
+    (49.9935, 36.2304, "Харків"),
+    (46.4825, 30.7233, "Одеса"),
+    (48.4647, 35.0462, "Дніпро"),
+    (47.8388, 35.1396, "Запоріжжя"),
+    (49.8397, 24.0297, "Львів"),
+    (47.9105, 33.3918, "Кривий Ріг"),
+    (46.9750, 31.9946, "Миколаїв"),
+    (49.2331, 28.4682, "Вінниця"),
+    (50.2547, 28.6587, "Житомир"),
+    (51.4982, 31.2893, "Чернігів"),
+    (49.4444, 32.0598, "Черкаси"),
+    (49.5883, 34.5514, "Полтава"),
+    (50.9077, 34.7981, "Суми"),
+    (50.6199, 26.2516, "Рівне"),
+    (50.7472, 25.3254, "Луцьк"),
+    (49.4230, 26.9871, "Хмельницький"),
+    (49.5535, 25.5948, "Тернопіль"),
+    (48.9226, 24.7111, "Івано-Франківськ"),
+    (48.2917, 25.9354, "Чернівці"),
+    (48.5079, 32.2623, "Кропивницький"),
+    (49.0700, 33.4200, "Кременчук"),
+]
+
+# How far back (km) to extrapolate the launch point per threat type.
+LAUNCH_BACK_KM: Dict[str, float] = {
+    "uav": 120.0,       # Shahed launched ~100-150 km inside Russia
+    "fpv": 40.0,        # FPV range ~5-20 km; fallback 40 km
+    "recon": 80.0,
+    "missile": 250.0,   # Cruise missile (Kh-101, Kalibr)
+    "ballistic": 350.0, # Iskander/KN-23
+    "kab": 60.0,        # KAB dropped from Su-35 ~40-80 km back
+    "mig31k": 500.0,    # MiG-31K/Kinzhal launched 400-700 km away
+    "unknown": 150.0,
+}
+
+
+def _haversine(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    R = 6371.0
+    dlat = math.radians(lat2 - lat1)
+    dlon = math.radians(lon2 - lon1)
+    a = (math.sin(dlat / 2) ** 2
+         + math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) * math.sin(dlon / 2) ** 2)
+    return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+
+
+def _bearing(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    la1, la2 = math.radians(lat1), math.radians(lat2)
+    dlon = math.radians(lon2 - lon1)
+    x = math.sin(dlon) * math.cos(la2)
+    y = math.cos(la1) * math.sin(la2) - math.sin(la1) * math.cos(la2) * math.cos(dlon)
+    return (math.degrees(math.atan2(x, y)) + 360) % 360
+
+
+def _dest_point(lat: float, lon: float, bearing_deg: float, km: float) -> Tuple[float, float]:
+    R = 6371.0
+    br = math.radians(bearing_deg)
+    la1, lo1 = math.radians(lat), math.radians(lon)
+    la2 = math.asin(math.sin(la1) * math.cos(km / R) + math.cos(la1) * math.sin(km / R) * math.cos(br))
+    lo2 = lo1 + math.atan2(
+        math.sin(br) * math.sin(km / R) * math.cos(la1),
+        math.cos(km / R) - math.sin(la1) * math.sin(la2),
+    )
+    return math.degrees(la2), math.degrees(lo2)
+
+
+# Known tactical launch bases and border launch areas for Russia / occupied territories
+KNOWN_LAUNCH_AREAS: List[Tuple[float, float, str]] = [
+    (50.5954, 36.5873, "Бєлгородська обл"),
+    (51.7303, 36.1926, "Курська обл"),
+    (52.7539, 32.2345, "Брянська обл (Клинці)"),
+    (51.6720, 39.1843, "Воронезька обл"),
+    (54.7826, 32.0453, "Смоленська обл"),
+    (45.0069, 35.8394, "Крим (Чауда)"),
+    (46.7128, 38.2741, "Єйськ"),
+    (46.0464, 38.1747, "Приморсько-Ахтарськ"),
+    (47.2362, 38.8969, "Таганрог / Ростов"),
+    (44.1500, 34.5000, "Чорне море (Калібри)"),
+]
+
+
+def estimate_launch_point(
+    lat: float, lon: float, bearing_deg: float, ntype: str, title: str = "", region: str = ""
+) -> Tuple[float, float, str]:
+    """Extrapolate backwards along heading or match known launch origin (Belgorod, Kursk, Bryansk, etc.).
+
+    Returns (launch_lat, launch_lon, origin_name).
+    """
+    text_ctx = f"{title} {region}".lower()
+    for olat, olon, oname in KNOWN_LAUNCH_AREAS:
+        if oname.lower() in text_ctx or oname.split()[0].lower() in text_ctx:
+            return olat, olon, oname
+
+    # For ballistic or missiles, see if back-extrapolated vector passes near known launch hubs
+    back_km = LAUNCH_BACK_KM.get(ntype, 150.0)
+    raw_back_lat, raw_back_lon = _dest_point(lat, lon, (bearing_deg + 180.0) % 360.0, back_km)
+
+    # Check if back point is within 120km of a known border launch hub (e.g. Kursk, Belgorod, Bryansk)
+    best_known: Optional[Tuple[float, float, float, str]] = None
+    for olat, olon, oname in KNOWN_LAUNCH_AREAS:
+        d = _haversine(raw_back_lat, raw_back_lon, olat, olon)
+        if d < 140.0:
+            if best_known is None or d < best_known[0]:
+                best_known = (d, olat, olon, oname)
+
+    if best_known:
+        return best_known[1], best_known[2], best_known[3]
+
+    return round(raw_back_lat, 5), round(raw_back_lon, 5), "Орієнтовний район пуску"
+
+
+def find_nearest_large_city_in_direction(
+    lat: float, lon: float, bearing_deg: float, angle_tolerance_deg: float = 70.0
+) -> Optional[Tuple[float, float, str]]:
+    """Nearest large Ukrainian city roughly in the direction of travel.
+
+    Filters to ±angle_tolerance_deg of heading, returns closest in sector.
+    Falls back to globally nearest city when nothing is in sector.
+    """
+    best: Optional[Tuple[float, float, float, str]] = None  # (dist, lat, lon, name)
+    for clat, clon, cname in LARGE_CITIES:
+        dist = _haversine(lat, lon, clat, clon)
+        to_city = _bearing(lat, lon, clat, clon)
+        angle_diff = abs(((to_city - bearing_deg + 180) % 360) - 180)
+        if angle_diff <= angle_tolerance_deg:
+            if best is None or dist < best[0]:
+                best = (dist, clat, clon, cname)
+    if best:
+        return best[1], best[2], best[3]
+    # Fallback: globally nearest
+    fb: Optional[Tuple[float, float, float, str]] = None
+    for clat, clon, cname in LARGE_CITIES:
+        dist = _haversine(lat, lon, clat, clon)
+        if fb is None or dist < fb[0]:
+            fb = (dist, clat, clon, cname)
+    return (fb[1], fb[2], fb[3]) if fb else None
 
 VALID_STATUSES = {"active", "stale"}
 
@@ -131,6 +273,58 @@ class NeptunThreatsService:
                 count = int(t.get("count") or 0)
             except (TypeError, ValueError):
                 count = 0
+            effective_bearing = bearing
+            if effective_bearing is None:
+                try:
+                    effective_bearing = float(t.get("heading")) if t.get("heading") is not None else None
+                except (TypeError, ValueError):
+                    effective_bearing = None
+
+            launch_info: Optional[Dict[str, Any]] = None
+            dest_info: Optional[Dict[str, Any]] = None
+            expected_trajectory: List[List[float]] = []
+
+            if effective_bearing is not None:
+                # 1. Estimate launch origin
+                l_lat, l_lon, l_name = estimate_launch_point(
+                    lat_f, lon_f, effective_bearing, ntype,
+                    title=str(t.get("title", "")),
+                    region=str(t.get("region", ""))
+                )
+                launch_info = {
+                    "lat": round(l_lat, 5),
+                    "lon": round(l_lon, 5),
+                    "name": l_name,
+                }
+
+                # 2. Estimate destination large city
+                d_res = find_nearest_large_city_in_direction(lat_f, lon_f, effective_bearing)
+                if d_res:
+                    d_lat, d_lon, d_name = d_res
+                    dest_info = {
+                        "lat": round(d_lat, 5),
+                        "lon": round(d_lon, 5),
+                        "name": d_name,
+                    }
+                    expected_trajectory = [
+                        [round(l_lat, 5), round(l_lon, 5)],
+                        [round(lat_f, 5), round(lon_f, 5)],
+                        [round(d_lat, 5), round(d_lon, 5)],
+                    ]
+                else:
+                    # Extrapolate forward ~80km if no city matched
+                    f_lat, f_lon = _dest_point(lat_f, lon_f, effective_bearing, 80.0)
+                    dest_info = {
+                        "lat": round(f_lat, 5),
+                        "lon": round(f_lon, 5),
+                        "name": "Очікуваний сектор",
+                    }
+                    expected_trajectory = [
+                        [round(l_lat, 5), round(l_lon, 5)],
+                        [round(lat_f, 5), round(lon_f, 5)],
+                        [round(f_lat, 5), round(f_lon, 5)],
+                    ]
+
             out.append({
                 "id": str(t.get("id", "")),
                 "ntype": ntype,
@@ -155,6 +349,9 @@ class NeptunThreatsService:
                 "areaOnly": bool(t.get("areaOnly", False)),
                 "explanation": str(t.get("explanationShort", "")),
                 "trail": t.get("trail", []),
+                "launch": launch_info,
+                "destination": dest_info,
+                "expectedTrajectory": expected_trajectory,
             })
         return out
 
