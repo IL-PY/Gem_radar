@@ -68,10 +68,7 @@ class TelegramMonitorService:
 
             # Keep client running in background
             self._listener_task = asyncio.create_task(self.client.run_until_disconnected())
-
-            # Startup catch-up: replay recent history so ongoing raids show up
-            # immediately (read-only, paced).
-            asyncio.create_task(self.catchup_history())
+            # Automatic history catchup disabled: targets only appear on incoming live events or manual user simulation.
 
         except FloodWaitError as e:
             self.status = "FLOOD_WAIT"
