@@ -1,2 +1,0 @@
-[      32ms] [INFO] %cDownload the React DevTools for a better development experience: https://react.dev/link/react-devtools font-weight:bold @ http://localhost:5173/node_modules/.vite/deps/react-dom_client.js?v=2cf1c21d:15804
-[      64ms] [WARNING] WebSocket connection to 'ws://localhost:5173/ws/radar' failed: WebSocket is closed before the connection is established. @ http://localhost:5173/src/App.tsx:92
