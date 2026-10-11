@@ -154,21 +154,26 @@ function destPoint(lat: number, lon: number, bearingDeg: number, km: number): [n
 }
 
 /** Dead-reckon a NEPTUN threat like their SDK predict(): velocity * time
- * since confirmedAt. Static otherwise (and always static for areaOnly). */
-function predictNeptun(t: NeptunThreat, nowMs: number): { lat: number; lon: number; heading: number | null } {
+ * since confirmedAt. Static otherwise (and always static for areaOnly).
+ * confirmedMs is pre-parsed once per fetch (never Date.parse in the loop). */
+function predictNeptun(t: NeptunThreat, nowMs: number, confirmedMs: number | null): { lat: number; lon: number; heading: number | null } {
   const h = t.heading ?? t.bearingDeg ?? null;
-  if (!t.areaOnly && t.status === 'active' && t.speedKmh && t.bearingDeg != null && t.confirmedAt) {
-    const ct = Date.parse(t.confirmedAt);
-    if (!isNaN(ct)) {
-      const dtH = Math.max(0, (nowMs - ct) / 3600000);
-      if (dtH > 0 && dtH <= 0.25) {
-        const distKm = Math.min(25, t.speedKmh * dtH);
-        const [la, lo] = destPoint(t.lat, t.lon, t.bearingDeg, distKm);
-        return { lat: la, lon: lo, heading: h };
-      }
+  if (!t.areaOnly && t.status === 'active' && t.speedKmh && t.bearingDeg != null && confirmedMs != null) {
+    const dtH = Math.max(0, (nowMs - confirmedMs) / 3600000);
+    if (dtH > 0 && dtH <= 0.25) {
+      const distKm = Math.min(25, t.speedKmh * dtH);
+      const [la, lo] = destPoint(t.lat, t.lon, t.bearingDeg, distKm);
+      return { lat: la, lon: lo, heading: h };
     }
   }
   return { lat: t.lat, lon: t.lon, heading: h };
+}
+
+/** Parse confirmedAt once (fetch cadence), cache per id for the frame loop. */
+function parseNeptunTime(t: NeptunThreat): number | null {
+  if (!t.confirmedAt) return null;
+  const ct = Date.parse(t.confirmedAt);
+  return isNaN(ct) ? null : ct;
 }
 
 export const TacticalMap: React.FC<TacticalMapProps> = ({
@@ -183,13 +188,29 @@ export const TacticalMap: React.FC<TacticalMapProps> = ({
   const mapRef = useRef<maplibregl.Map | null>(null);
   const [mapReady, setMapReady] = useState<boolean>(false);
 
-  // Markers references
+  // Markers references (rotor/badge elements cached at creation so the
+  // 60fps loop never touches querySelector/getElementById).
   const htmlMarkersRef = useRef<Map<string, {
     missileMarker: maplibregl.Marker;
     launcherMarker?: maplibregl.Marker;
     destMarker?: maplibregl.Marker;
     altitudeBadge?: maplibregl.Marker;
+    rotorEl: HTMLElement | null;
+    badgeEl: HTMLElement | null;
+    lastBadgeText: string;
   }>>(new Map());
+
+  // Lifted-arc overlay cache: static ground projections are re-projected
+  // only when the camera moves or tracks change; every frame reuses Path2D.
+  const arcCacheRef = useRef<Map<string, {
+    path: Path2D;
+    glow: string;
+    core: string;
+    dash: number[];
+    dashMult: number;
+  }>>(new Map());
+  const arcsDirtyRef = useRef<boolean>(true);
+  const canvasSizeRef = useRef<{ w: number; h: number }>({ w: 0, h: 0 });
 
   // Targets that already reached the destination (progress >= 1).
   // Their trajectory + missile icon are hidden until backend deletes them.
@@ -205,6 +226,8 @@ export const TacticalMap: React.FC<TacticalMapProps> = ({
   const showNeptunRef = useRef<boolean>(true);
   // NEPTUN live threat tracks (points with heading, dead-reckoned per frame).
   const neptunRef = useRef<NeptunThreat[]>([]);
+  // confirmedAt parsed once per fetch (avoids Date.parse() in the 60fps loop).
+  const neptunTimeRef = useRef<Map<string, number | null>>(new Map());
   const neptunLiveRef = useRef<Map<string, {
     marker: maplibregl.Marker;
     launchMarker?: maplibregl.Marker;
@@ -261,12 +284,13 @@ export const TacticalMap: React.FC<TacticalMapProps> = ({
         // In 3D every trajectory lives on the overlay canvas (lifted);
         // the ground line stays only as a dim shadow underneath.
         const dimmed = is3D;
+        const skin = skinOf(t.threat_type);
         return {
           type: 'Feature' as const,
           properties: {
             id: t.id,
-            color: skinOf(t.threat_type).groundGlow,
-            coreColor: skinOf(t.threat_type).groundCore,
+            color: skin.groundGlow,
+            coreColor: skin.groundCore,
             glowWidth: dimmed ? 4 : 10,
             glowOpacity: dimmed ? 0.25 : 0.7,
             coreWidth: dimmed ? 1.5 : 4,
@@ -445,7 +469,8 @@ export const TacticalMap: React.FC<TacticalMapProps> = ({
       let destMarker: maplibregl.Marker | undefined;
 
       try {
-        const p = predictNeptun(t, Date.now());
+        const nowMs = Date.now();
+        const p = predictNeptun(t, nowMs, parseNeptunTime(t));
         marker = new maplibregl.Marker({ element: el }).setLngLat([p.lon, p.lat]).addTo(map);
 
         // Add launch origin marker if available
@@ -825,6 +850,9 @@ export const TacticalMap: React.FC<TacticalMapProps> = ({
         if (cancelled) return;
         const list: NeptunThreat[] = Array.isArray(s.threats) ? s.threats : [];
         neptunRef.current = list;
+        const tm = new Map<string, number | null>();
+        list.forEach((t) => tm.set(t.id, parseNeptunTime(t)));
+        neptunTimeRef.current = tm;
         upsertNeptunLive();
         setNeptunMeta({
           count: list.length,
@@ -862,6 +890,8 @@ export const TacticalMap: React.FC<TacticalMapProps> = ({
 
     // Ground lines (arrived targets excluded — trajectory vanishes on impact)
     pushGroundFeatures();
+    // Lifted-arc overlay projections depend on the same track set.
+    arcsDirtyRef.current = true;
 
     // Clean up deleted HTML markers
     htmlMarkersRef.current.forEach((markers, id) => {
@@ -904,6 +934,8 @@ export const TacticalMap: React.FC<TacticalMapProps> = ({
         const missileMarker = new maplibregl.Marker({ element: missileEl })
           .setLngLat([target.current_position.lon, target.current_position.lat])
           .addTo(map);
+        // Cached once: the 60fps loop rotates this without DOM queries.
+        const rotorEl = missileEl.querySelector('.missile-rotor') as HTMLElement | null;
 
         // Launcher SPU
         let launcherMarker: maplibregl.Marker | undefined;
@@ -950,7 +982,7 @@ export const TacticalMap: React.FC<TacticalMapProps> = ({
           .setLngLat([target.current_position.lon, target.current_position.lat])
           .addTo(map);
 
-        markers = { missileMarker, launcherMarker, destMarker, altitudeBadge };
+        markers = { missileMarker, launcherMarker, destMarker, altitudeBadge, rotorEl, badgeEl: altBadgeEl, lastBadgeText: '' };
         htmlMarkersRef.current.set(target.id, markers);
       }
     });
@@ -960,34 +992,19 @@ export const TacticalMap: React.FC<TacticalMapProps> = ({
   useEffect(() => {
     let animId: number;
 
-    const drawLiftedArcs = () => {
-      const canvas = arcCanvasRef.current;
+    // Rebuild cached Path2D arcs — runs ONLY when the camera moves or
+    // tracks change. The per-frame draw then just re-strokes cached paths
+    // with the marching-ants dash offset (no map.project, no re-tracing).
+    const rebuildArcCache = () => {
       const map = mapRef.current;
-      const container = mapContainerRef.current;
-      if (!canvas || !map || !container) return;
-      const rect = container.getBoundingClientRect();
-      const dpr = Math.min(window.devicePixelRatio || 1, 2);
-      const W = Math.max(1, Math.round(rect.width));
-      const H = Math.max(1, Math.round(rect.height));
-      if (canvas.width !== Math.round(W * dpr) || canvas.height !== Math.round(H * dpr)) {
-        canvas.width = Math.round(W * dpr);
-        canvas.height = Math.round(H * dpr);
-      }
-      const ctx = canvas.getContext('2d');
-      if (!ctx) return;
-      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-      ctx.clearRect(0, 0, W, H);
-
-      // Overlay draws in every mode. In 3D ALL types are lifted (low
-      // flyers on a schematic arc, see visualAltAt); in 2D only the
-      // dashed/dotted low tracks are drawn (lifted types match ground 1:1).
+      if (!map) return;
       const in3D = viewModeRef.current === '3D';
       const pitchRad = (map.getPitch() * Math.PI) / 180;
       const sinP = Math.sin(pitchRad);
       const zoom = map.getZoom();
       const nowS = Date.now() / 1000;
-      const dashBase = dashOffRef.current;
-
+      const cache = arcCacheRef.current;
+      cache.clear();
       for (const target of targetsRef.current) {
         if (!target.trajectory_arc || target.trajectory_arc.length < 2) continue;
         // Vanished after impact
@@ -998,10 +1015,7 @@ export const TacticalMap: React.FC<TacticalMapProps> = ({
         const arc = target.trajectory_arc;
         const n = arc.length;
         const skin = skinOf(target.threat_type);
-        const glow = skin.overlayGlow;
-        const core = skin.overlayCore;
-
-        const pts: Array<[number, number]> = new Array(n);
+        const path = new Path2D();
         for (let i = 0; i < n; i++) {
           const lat = arc[i][0];
           const lon = arc[i][1];
@@ -1009,7 +1023,8 @@ export const TacticalMap: React.FC<TacticalMapProps> = ({
           const alt = visualAltAt(i / (n - 1), target.threat_type);
           const mp = (Math.cos((lat * Math.PI) / 180) * 40075016) / (256 * Math.pow(2, zoom));
           const yOff = in3D ? ((alt / mp) * sinP * ALT_PX_EXAGGERATION) : 0;
-          pts[i] = [p.x, p.y - yOff];
+          if (i === 0) path.moveTo(p.x, p.y - yOff);
+          else path.lineTo(p.x, p.y - yOff);
         }
 
         // Per-type stroke character: ballistic/KAB solid lifted arcs,
@@ -1020,35 +1035,51 @@ export const TacticalMap: React.FC<TacticalMapProps> = ({
         else if (target.threat_type === 'JET_SHAHED') { dash = [12, 6]; dashMult = 2.3; }
         else if (target.threat_type === 'CRUISE_MISSILE') { dash = [16, 9]; dashMult = 1.5; }
         else if (target.threat_type === 'RECON_UAV') { dash = [2, 7]; dashMult = 0.45; }
-        const dashOff = dash.length ? -dashBase * dashMult : 0;
-
-        const strokePath = (
-          width: number,
-          style: string,
-          alpha: number,
-          blur: number,
-        ) => {
-          ctx.save();
-          ctx.globalAlpha = alpha;
-          ctx.strokeStyle = style;
-          ctx.lineWidth = width;
-          ctx.lineCap = 'round';
-          ctx.lineJoin = 'round';
-          ctx.setLineDash(dash);
-          ctx.lineDashOffset = dashOff;
-          ctx.shadowColor = glow;
-          ctx.shadowBlur = blur;
-          ctx.beginPath();
-          ctx.moveTo(pts[0][0], pts[0][1]);
-          for (let i = 1; i < n; i++) ctx.lineTo(pts[i][0], pts[i][1]);
-          ctx.stroke();
-          ctx.restore();
-        };
-
-        // Outer neon glow + bright core — same palette as ground line.
-        strokePath(9, glow, 0.4, 14);
-        strokePath(3, core, 0.95, 6);
+        cache.set(target.id, { path, glow: skin.overlayGlow, core: skin.overlayCore, dash, dashMult });
       }
+      arcsDirtyRef.current = false;
+    };
+
+    const drawLiftedArcs = () => {
+      const canvas = arcCanvasRef.current;
+      const map = mapRef.current;
+      if (!canvas || !map) return;
+      const { w: W, h: H } = canvasSizeRef.current;
+      if (W < 1 || H < 1 || canvas.width < 1) return;
+      if (arcsDirtyRef.current) rebuildArcCache();
+      const ctx = canvas.getContext('2d');
+      if (!ctx) return;
+      const dpr = Math.min(window.devicePixelRatio || 1, 2);
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      ctx.clearRect(0, 0, W, H);
+      const dashBase = dashOffRef.current;
+
+      arcCacheRef.current.forEach((e) => {
+        const dashOff = e.dash.length ? -dashBase * e.dashMult : 0;
+        // Outer neon glow + bright core — same palette/widths as before.
+        // No shadowBlur: the wide glow pass already renders the halo at a
+        // fraction of the GPU cost. Visually identical at these widths.
+        ctx.save();
+        ctx.globalAlpha = 0.4;
+        ctx.strokeStyle = e.glow;
+        ctx.lineWidth = 9;
+        ctx.lineCap = 'round';
+        ctx.lineJoin = 'round';
+        ctx.setLineDash(e.dash);
+        ctx.lineDashOffset = dashOff;
+        ctx.stroke(e.path);
+        ctx.restore();
+        ctx.save();
+        ctx.globalAlpha = 0.95;
+        ctx.strokeStyle = e.core;
+        ctx.lineWidth = 3;
+        ctx.lineCap = 'round';
+        ctx.lineJoin = 'round';
+        ctx.setLineDash(e.dash);
+        ctx.lineDashOffset = dashOff;
+        ctx.stroke(e.path);
+        ctx.restore();
+      });
     };
 
     const tickAnimation = () => {
@@ -1142,15 +1173,17 @@ export const TacticalMap: React.FC<TacticalMapProps> = ({
           const dy = (pn.y - liftOf(nextLat, nextAlt)) - (pc.y - yOffPx);
           if (dx * dx + dy * dy > 0.25) {
             const screenAng = ((Math.atan2(dx, -dy) * 180) / Math.PI + 360) % 360;
-            const rotor = markers.missileMarker.getElement().querySelector('.missile-rotor') as HTMLElement | null;
-            if (rotor) rotor.style.transform = `rotate(${screenAng.toFixed(1)}deg)`;
+            if (markers.rotorEl) markers.rotorEl.style.transform = `rotate(${screenAng.toFixed(1)}deg)`;
           }
         }
-        if (markers.altitudeBadge) {
+        if (markers.altitudeBadge && markers.badgeEl) {
           markers.altitudeBadge.setLngLat([currLon, currLat]);
-          const badgeEl = document.getElementById(`alt-badge-${target.id}`);
-          if (badgeEl) {
-            badgeEl.innerText = `ВИС: ${currAltKm} км | ETA: ${Math.max(0, Math.round(totalDuration - elapsed))}с`;
+          // Same text as before — DOM write only when it actually changes
+          // (ETA ticks 1Hz, altitude ~a few Hz; not 60fps layout churn).
+          const badgeText = `ВИС: ${currAltKm} км | ETA: ${Math.max(0, Math.round(totalDuration - elapsed))}с`;
+          if (badgeText !== markers.lastBadgeText) {
+            markers.lastBadgeText = badgeText;
+            markers.badgeEl.innerText = badgeText;
           }
         }
       });
@@ -1167,7 +1200,7 @@ export const TacticalMap: React.FC<TacticalMapProps> = ({
         neptunRef.current.forEach((t) => {
           const rec = neptunLiveRef.current.get(t.id);
           if (!rec) return;
-          const p = predictNeptun(t, nowMs);
+          const p = predictNeptun(t, nowMs, neptunTimeRef.current.get(t.id) ?? null);
           try {
             rec.marker.setLngLat([p.lon, p.lat]);
           } catch { /* torn down */ }
