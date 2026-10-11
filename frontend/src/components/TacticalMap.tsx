@@ -659,10 +659,10 @@ export const TacticalMap: React.FC<TacticalMapProps> = ({
               'line-join': 'round',
             },
             paint: {
-              'line-color': ['get', 'color'],
+              'line-color': ['coalesce', ['get', 'color'], '#38bdf8'],
               'line-width': 6,
               'line-blur': 3,
-              'line-opacity': 0.45,
+              'line-opacity': 0.5,
             },
           },
           {
@@ -674,9 +674,9 @@ export const TacticalMap: React.FC<TacticalMapProps> = ({
               'line-join': 'round',
             },
             paint: {
-              'line-color': ['get', 'color'],
-              'line-width': 2.2,
-              'line-opacity': 0.85,
+              'line-color': ['coalesce', ['get', 'color'], '#38bdf8'],
+              'line-width': 2.5,
+              'line-opacity': 0.9,
               'line-dasharray': [3, 2],
             },
           },
@@ -718,6 +718,7 @@ export const TacticalMap: React.FC<TacticalMapProps> = ({
       setMapReady(true);
       addRegionBadges();
       upsertNeptunLive();
+      pushNeptunTrajectories();
     };
 
     map.on('load', markReady);
