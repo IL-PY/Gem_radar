@@ -1,0 +1,6 @@
+[      46ms] [INFO] %cDownload the React DevTools for a better development experience: https://react.dev/link/react-devtools font-weight:bold @ http://localhost:5173/node_modules/.vite/deps/react-dom_client.js?v=3a2473cf:15804
+[     114ms] [WARNING] WebSocket connection to 'ws://localhost:5173/ws/radar' failed: WebSocket is closed before the connection is established. @ http://localhost:5173/src/App.tsx?t=1791628096689:92
+[     144ms] [ERROR] Error: Worker failed to load. Check that the worker URL is correct.
+    at Worker.<anonymous> (http://localhost:5173/node_modules/.vite/deps/maplibre-gl.js?v=917cb823:18649:37) @ http://localhost:5173/node_modules/.vite/deps/maplibre-gl.js?v=917cb823:1329
+[     144ms] [WARNING] [MapLibre warning] z @ http://localhost:5173/src/components/TacticalMap.tsx?t=1791628096689:217
+[    3626ms] [WARNING] [Map] load timeout — forcing ready so targets render @ http://localhost:5173/src/components/TacticalMap.tsx?t=1791628096689:289
