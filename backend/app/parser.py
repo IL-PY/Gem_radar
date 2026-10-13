@@ -5,7 +5,6 @@ from typing import Optional, Tuple, List, Dict, Any
 from app.models import ThreatType, ThreatStatus, RadarTarget, GeoPoint
 from app.geo_database import (
     UKRAINE_GEO,
-    LAUNCH_ORIGINS,
     find_geo_location,
     find_district,
     find_launch_origin,
@@ -252,7 +251,8 @@ class ThreatParser:
             if low_confidence or cls_info["uncertain"]:
                 target.confidence = 0.5
                 target.threat_level = "MEDIUM"
-                target.name = f"❓ {target.name}"
+                if not target.name.startswith("❓"):
+                    target.name = f"❓ {target.name}"
             engine.add_target(target)
             result["added"].append(target)
         else:
@@ -296,21 +296,37 @@ class ThreatParser:
         return None
 
     @classmethod
-    def extract_origin_and_dest(cls, text: str, default_threat: ThreatType) -> Tuple[GeoPoint, GeoPoint]:
+    def extract_origin_and_dest(
+        cls, text: str, default_threat: ThreatType
+    ) -> Tuple[Optional[GeoPoint], Optional[GeoPoint], bool, bool]:
+        """Smart origin/destination extraction.
+
+        Returns (origin|None, dest|None, origin_explicit, dest_explicit).
+        Explicit mentions (with declensions and direction words) are
+        honoured. NOTHING is invented here: no 'Чауда by default' —
+        unknown sides come back as None and the caller starts the track
+        where it was actually seen, with low confidence. Only the
+        destination keeps a per-type APPROXIMATE fallback ('куда будет
+        приблизительно'), flagged invented via explicit=False.
+        """
         origin: Optional[GeoPoint] = None
         dest: Optional[GeoPoint] = None
+        origin_explicit = False
+        dest_explicit = False
 
         # 1. Search for explicit origin
         origin_match = cls.RE_ORIGIN.search(text)
         if origin_match:
             chunk = origin_match.group(1)[:30]
             origin = find_launch_origin(chunk) or find_geo_location(chunk)
+            origin_explicit = origin is not None
 
         # 2. Search for explicit destination
         dest_match = cls.RE_DESTINATION.search(text)
         if dest_match:
             chunk = dest_match.group(1)[:30]
             dest = find_geo_location(chunk) or find_district(chunk)
+            dest_explicit = dest is not None
 
         # 2b. Terse vectors without "на": "Вектор Оболонь", "далі Київ", "~Нивки"
         if not dest:
@@ -318,43 +334,38 @@ class ThreatParser:
             if vec_match:
                 chunk = vec_match.group(1)[:30].lstrip("~")
                 dest = find_geo_location(chunk) or find_district(chunk)
+                dest_explicit = dest is not None
 
         # 3. Fallback scan across text if not captured by regex
         if not dest:
             dest = find_geo_location(text) or find_district(text)
+            dest_explicit = dest is not None
         if not origin:
             origin = find_launch_origin(text)
+            origin_explicit = origin is not None
 
-        # 4. Logical defaults if partially identified
+        # 4. Approximate destination fallback per type ("куда будет
+        # приблизительно"). Origin is NEVER defaulted to a specific
+        # base here — inventing 'Чауда' for every jet shahed was the bug.
         # NOTE: always copy — globals must never be mutated by engine ticks
-        if default_threat == ThreatType.BALLISTIC:
-            if not origin:
-                # Most frequent ballistic launch area to northern targets: Bryansk / Klintsy
-                origin = LAUNCH_ORIGINS["брянськ"].model_copy(deep=True)
-            if not dest:
-                # Default high-alert target
+        if not dest:
+            if default_threat == ThreatType.BALLISTIC:
                 dest = UKRAINE_GEO["київ"].model_copy(deep=True)
-        elif default_threat == ThreatType.SHAHED or default_threat == ThreatType.JET_SHAHED:
-            if not origin:
-                origin = LAUNCH_ORIGINS["чауда"].model_copy(deep=True)
-            if not dest:
+            elif default_threat == ThreatType.SHAHED or default_threat == ThreatType.JET_SHAHED:
                 dest = UKRAINE_GEO["умань"].model_copy(deep=True)
-        elif default_threat == ThreatType.CRUISE_MISSILE:
-            if not origin:
-                origin = LAUNCH_ORIGINS["каспій"].model_copy(deep=True)
-            if not dest:
+            elif default_threat == ThreatType.CRUISE_MISSILE:
                 dest = UKRAINE_GEO["дніпро"].model_copy(deep=True)
-        else:
-            if not origin:
-                origin = LAUNCH_ORIGINS["курськ"].model_copy(deep=True)
-            if not dest:
+            else:
                 dest = UKRAINE_GEO["харків"].model_copy(deep=True)
 
         # find_* already returns copies, but ensure independence anyway
-        origin = origin.model_copy(deep=True)
+        if origin is not None:
+            origin = origin.model_copy(deep=True)
+        # Approximate fallback always provides a destination.
+        assert dest is not None
         dest = dest.model_copy(deep=True)
 
-        return origin, dest
+        return origin, dest, origin_explicit, dest_explicit
 
     @classmethod
     def parse_message(
@@ -367,7 +378,15 @@ class ThreatParser:
         if not threat_type:
             return None
 
-        origin, dest = cls.extract_origin_and_dest(text, threat_type)
+        origin, dest, origin_explicit, dest_explicit = cls.extract_origin_and_dest(text, threat_type)
+        assert dest is not None  # approximate fallback always provides one
+        # Honest origin: NEVER invent a launch base. Without an explicit
+        # launch mention the track starts where it was actually seen
+        # (overflight point) or, if only a destination is known, at the
+        # destination zone — flagged low-confidence downstream.
+        geo_invented = (not origin_explicit) or (not dest_explicit)
+        if origin is None:
+            origin = cls.extract_point(text) or dest.model_copy(deep=True)
         dist_km = haversine_distance_km(origin, dest)
 
         # Threat-specific speed and ETA kinematics
@@ -411,6 +430,22 @@ class ThreatParser:
         bearing = calculate_bearing(origin, dest)
         now = time.time()
 
+        # Presence-only reports (origin == dest: single place mentioned,
+        # no movement info) must not die instantly with eta 0. Floor the
+        # lifetime so the marker persists until follow-ups or all-clear.
+        # Long fake legs used to provide this lifetime for free.
+        if dist_km < 1.0:
+            flight_time_sec = max(flight_time_sec, 900.0)
+
+        # Invented geography (unknown launch and/or approximate
+        # destination) is shown honestly: same danger level, but low
+        # confidence + ❓ so a guessed track never looks confirmed.
+        confidence = 1.0
+        if geo_invented:
+            confidence = 0.5
+            if not name.startswith("❓"):
+                name = f"❓ {name}"
+
         return RadarTarget(
             id=str(uuid.uuid4())[:8],
             name=name,
@@ -429,5 +464,6 @@ class ThreatParser:
             source_channel=channel,
             raw_text=text.strip(),
             threat_level=threat_level,
+            confidence=confidence,
             launcher_pos=launcher_pos.model_copy(deep=True) if launcher_pos else None,
         )

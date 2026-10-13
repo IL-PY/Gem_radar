@@ -1,4 +1,5 @@
 import math
+import re
 from typing import Dict, List, Optional, Tuple
 from app.models import GeoPoint
 
@@ -90,6 +91,24 @@ UKRAINE_GEO: Dict[str, GeoPoint] = {
     "івано-франківськ": GeoPoint(lat=48.9226, lon=24.7111, name="Івано-Франківськ"),
     "чернівці": GeoPoint(lat=48.2917, lon=25.9354, name="Чернівці"),
     "ужгород": GeoPoint(lat=48.6208, lon=22.2879, name="Ужгород"),
+    # Declension aliases: monitor texts use oblique cases
+    # ("на Одесу", "у районі Сум", "києва", "Кривого Рогу").
+    "києва": GeoPoint(lat=50.4501, lon=30.5234, name="Київ"),
+    "києві": GeoPoint(lat=50.4501, lon=30.5234, name="Київ"),
+    "києвом": GeoPoint(lat=50.4501, lon=30.5234, name="Київ"),
+    "одеси": GeoPoint(lat=46.4825, lon=30.7233, name="Одеса"),
+    "одесу": GeoPoint(lat=46.4825, lon=30.7233, name="Одеса"),
+    "одесою": GeoPoint(lat=46.4825, lon=30.7233, name="Одеса"),
+    "сумщин": GeoPoint(lat=50.9077, lon=34.7981, name="Суми"),
+    "сумськ": GeoPoint(lat=50.9077, lon=34.7981, name="Суми"),
+    "сумах": GeoPoint(lat=50.9077, lon=34.7981, name="Суми"),
+    "кривого рогу": GeoPoint(lat=47.9105, lon=33.3918, name="Кривий Ріг"),
+    "рогу": GeoPoint(lat=47.9105, lon=33.3918, name="Кривий Ріг"),
+    "харкова": GeoPoint(lat=49.9935, lon=36.2304, name="Харків"),
+    "харкові": GeoPoint(lat=49.9935, lon=36.2304, name="Харків"),
+    "харковом": GeoPoint(lat=49.9935, lon=36.2304, name="Харків"),
+    "львова": GeoPoint(lat=49.8397, lon=24.0297, name="Львів"),
+    "львові": GeoPoint(lat=49.8397, lon=24.0297, name="Львів"),
 }
 
 # Known launch / spotted origin regions
@@ -126,6 +145,22 @@ LAUNCH_ORIGINS: Dict[str, GeoPoint] = {
     "південь": GeoPoint(lat=45.2000, lon=35.5000, name="Південний напрямок"),
     "північ": GeoPoint(lat=52.5000, lon=33.0000, name="Північний напрямок"),
     "схід": GeoPoint(lat=48.5000, lon=38.5000, name="Східний напрямок"),
+    # Declension aliases for direction words ("з півдня", "зі сходу").
+    # Stem matcher covers most, these close the і/о-alternation gaps.
+    "півдня": GeoPoint(lat=45.2000, lon=35.5000, name="Південний напрямок"),
+    "південний": GeoPoint(lat=45.2000, lon=35.5000, name="Південний напрямок"),
+    "південному": GeoPoint(lat=45.2000, lon=35.5000, name="Південний напрямок"),
+    "півночі": GeoPoint(lat=52.5000, lon=33.0000, name="Північний напрямок"),
+    "північний": GeoPoint(lat=52.5000, lon=33.0000, name="Північний напрямок"),
+    "північному": GeoPoint(lat=52.5000, lon=33.0000, name="Північний напрямок"),
+    "сходу": GeoPoint(lat=48.5000, lon=38.5000, name="Східний напрямок"),
+    "східний": GeoPoint(lat=48.5000, lon=38.5000, name="Східний напрямок"),
+    "східному": GeoPoint(lat=48.5000, lon=38.5000, name="Східний напрямок"),
+    "сході": GeoPoint(lat=48.5000, lon=38.5000, name="Східний напрямок"),
+    # Oblique cases of maritime launch zones ("з Чорного моря").
+    "чорного моря": GeoPoint(lat=44.1500, lon=34.5000, name="Чорне море (Калібри)"),
+    "чорним морем": GeoPoint(lat=44.1500, lon=34.5000, name="Чорне море (Калібри)"),
+    "чорному морі": GeoPoint(lat=44.1500, lon=34.5000, name="Чорне море (Калібри)"),
 }
 
 
@@ -250,13 +285,91 @@ def generate_linear_waypoints(
     return coords
 
 
-def find_geo_location(text: str) -> Optional[GeoPoint]:
-    """Finds matching Ukrainian settlement or region from text."""
-    lower_text = text.lower()
-    for name, point in UKRAINE_GEO.items():
+_WORD_RE = re.compile(r"[а-яіїєґa-z']+", re.IGNORECASE)
+
+
+def _norm_token(word: str) -> str:
+    """Lowercase + unify yo/ye variants across RU/UA mixed texts."""
+    return word.lower().replace("ё", "е").replace("є", "е")
+
+
+def _tokens(text: str) -> List[str]:
+    return [_norm_token(w) for w in _WORD_RE.findall(text or "")]
+
+
+_INFLECTION_TAIL = "аеєиіїоуюяыэёь"
+
+
+def _stem(word: str) -> str:
+    """Inflection-resistant stem: strip the variable ending only.
+
+    Only trailing vowels/soft sign are cut ('одеса'->'одес',
+    'умань'->'уман'), consonant-final words stay whole ('курск',
+    'курськ', 'воронеж') — so plain words like 'курсом' or
+    'ворожий' can never collide with them. 4-letter vowel-final
+    words ('суми'->'сум') match whole tokens only (see
+    _part_matches), which keeps 'Сум' but rejects 'сумно'.
+    """
+    w = _norm_token(word)
+    while len(w) > 4 and w[-1] in _INFLECTION_TAIL:
+        w = w[:-1]
+    if len(w) == 4 and w[-1] in _INFLECTION_TAIL:
+        w = w[:-1]
+    return w
+
+
+def _part_matches(key_word: str, tokens: List[str]) -> bool:
+    """One entry word against text tokens.
+
+    - stem >= 4 chars: prefix match ('одесу' startswith 'одес');
+    - 3-char stems (from 4-letter words like 'суми'): whole-token
+      equality only, so 'Сум' matches but 'сумно'/'сумка' don't;
+    - shorter: exact substring handled by the fast path, skip here.
+    """
+    stem = _stem(key_word)
+    if len(stem) >= 4:
+        return any(len(t) >= 4 and t.startswith(stem) for t in tokens)
+    if len(stem) == 3:
+        return any(t == stem for t in tokens)
+    return False
+
+
+def _match_entry(name: str, tokens: List[str]) -> bool:
+    """True when EVERY significant word of the entry matches a token.
+
+    Multi-word entries ('чорне море') need all parts, so a lone
+    'моря' never fires without 'чорн'.
+    """
+    parts = [p for p in re.split(r"[\s\-’']+", name.lower()) if len(p) >= 3]
+    if not parts:
+        return False
+    return all(_part_matches(p, tokens) for p in parts)
+
+
+def _find_in(text: str, table: Dict[str, GeoPoint]) -> Optional[GeoPoint]:
+    # Fast path: exact mention (preserves previous behaviour).
+    lower_text = (text or "").lower()
+    for name, point in table.items():
         if name in lower_text:
             return point.model_copy(deep=True)
+    # Fallback: stem match per word — covers UA/RU declensions
+    # ('Одесу'->'одеса', 'Чорного моря'->'чорне море').
+    tokens = _tokens(text)
+    if not tokens:
+        return None
+    for name, point in table.items():
+        if _match_entry(name, tokens):
+            return point.model_copy(deep=True)
     return None
+
+
+def find_geo_location(text: str) -> Optional[GeoPoint]:
+    """Finds matching Ukrainian settlement or region from text.
+
+    Matches oblique cases too ('на Одесу', 'у районі Сум'). Exact
+    mentions win; stem fallback never splits multi-word names.
+    """
+    return _find_in(text, UKRAINE_GEO)
 
 
 # Kyiv city districts — monitor channels report vectors at district precision
@@ -294,17 +407,14 @@ KYIV_DISTRICTS: Dict[str, GeoPoint] = {
 
 def find_district(text: str) -> Optional[GeoPoint]:
     """Finds matching Kyiv district from text (district-level vectors)."""
-    lower_text = text.lower()
-    for name, point in KYIV_DISTRICTS.items():
-        if name in lower_text:
-            return point.model_copy(deep=True)
-    return None
+    return _find_in(text, KYIV_DISTRICTS)
 
 
 def find_launch_origin(text: str) -> Optional[GeoPoint]:
-    """Finds matching launch origin from text."""
-    lower_text = text.lower()
-    for name, point in LAUNCH_ORIGINS.items():
-        if name in lower_text:
-            return point.model_copy(deep=True)
-    return None
+    """Finds matching launch origin from text.
+
+    Stem matching is deliberately conservative: 'крилата ракета'
+    must NOT match 'крим', 'ворожий шахед' must NOT match
+    'воронеж' (see _part_matches).
+    """
+    return _find_in(text, LAUNCH_ORIGINS)
