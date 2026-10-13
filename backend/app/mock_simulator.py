@@ -69,7 +69,7 @@ class MockSimulator:
         speed_kmh = 175.0
         flight_time_sec = round(dist_km / (speed_kmh / 3600.0), 1)
 
-        path = generate_linear_waypoints(origin, dest, num_points=45, weave_deg=0.09, weave_cycles=2.5)
+        path = generate_linear_waypoints(origin, dest, num_points=45, weave_deg=0.03, weave_cycles=1.2)
         now = time.time()
 
         target = RadarTarget(
@@ -164,7 +164,7 @@ class MockSimulator:
         speed_kmh = 550.0
         flight_time_sec = round(dist_km / (speed_kmh / 3600.0), 1)
 
-        path = generate_linear_waypoints(origin, dest, num_points=40, weave_deg=0.04, weave_cycles=1.2)
+        path = generate_linear_waypoints(origin, dest, num_points=40, weave_deg=0.025, weave_cycles=1.0)
         now = time.time()
 
         target = RadarTarget(

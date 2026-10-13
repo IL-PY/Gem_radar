@@ -138,14 +138,14 @@ def _scaled_weave(
 ) -> Tuple[float, float]:
     """Scale the S-weave to the leg length.
 
-    A fixed cycle count looks gentle on a 300 km leg but draws wild loops
-    on a 40 km final leg into the target. One full swing per ~150 km and
-    lateral amplitude capped at ~6% of the leg length instead.
+    One full swing per ~250 km and lateral amplitude capped at ~3% of
+    the leg length instead — forecast vectors must read as confident
+    straight lines, not shaky snakes.
     """
     leg_km = _haversine(lat0, lon0, lat1, lon1)
     deg_len = math.hypot(lat1 - lat0, lon1 - lon0)
-    cycles = min(weave_cycles, max(0.6, leg_km / 150.0))
-    amp = min(weave_deg, deg_len * 0.06)
+    cycles = min(weave_cycles, max(0.6, leg_km / 250.0))
+    amp = min(weave_deg, deg_len * 0.03)
     return amp, cycles
 
 
@@ -176,13 +176,13 @@ def build_forward_trajectory(
         leg = _weave_leg(c_lat, c_lon, d_lat, d_lon, n, 0.0, 0.0)
     else:
         if is_jet or fam == "JET_SHAHED":
-            weave, cycles = 0.04, 1.2
+            weave, cycles = 0.025, 1.0
         elif fam == "CRUISE_MISSILE":
-            weave, cycles = 0.035, 1.5
+            weave, cycles = 0.02, 1.0
         elif fam in ("SHAHED", "FPV"):
-            weave, cycles = 0.09, 2.5
+            weave, cycles = 0.03, 1.2
         else:
-            weave, cycles = 0.05, 2.0
+            weave, cycles = 0.02, 1.0
         weave, cycles = _scaled_weave(weave, cycles, c_lat, c_lon, d_lat, d_lon)
         leg = _weave_leg(c_lat, c_lon, d_lat, d_lon, n, weave, cycles)
 

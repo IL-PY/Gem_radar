@@ -258,6 +258,8 @@ def generate_linear_waypoints(
 
     The weave scales to the leg length: a fixed cycle count draws wild
     loops on short final legs, so short legs get fewer, smaller swings.
+    Amplitude is kept whisper-thin (~3% of the leg) so forecast vectors
+    read as confident straight lines, not shaky snakes.
     """
     # Perpendicular unit normal to the flight direction
     d_lat = dest.lat - origin.lat
@@ -269,8 +271,8 @@ def generate_linear_waypoints(
         n_lat, n_lon = 0.0, 0.0
 
     leg_km = haversine_distance_km(origin, dest)
-    eff_cycles = min(weave_cycles, max(0.6, leg_km / 150.0))
-    eff_weave = min(weave_deg, norm_len * 0.06)
+    eff_cycles = min(weave_cycles, max(0.6, leg_km / 250.0))
+    eff_weave = min(weave_deg, norm_len * 0.03)
 
     coords: List[List[float]] = []
     for i in range(num_points + 1):

@@ -413,7 +413,7 @@ class ThreatParser:
             name = "Реактивний БПЛА Shahed-238"
             threat_level = "CRITICAL"
             # Jet drones fly faster, higher and straighter than prop ones
-            trajectory = generate_linear_waypoints(origin, dest, num_points=40, weave_deg=0.04, weave_cycles=1.2)
+            trajectory = generate_linear_waypoints(origin, dest, num_points=40, weave_deg=0.025, weave_cycles=1.0)
             flight_time_sec = dist_km / (speed_kmh / 3600.0)
             launcher_pos = None
         elif threat_type == ThreatType.CRUISE_MISSILE:
