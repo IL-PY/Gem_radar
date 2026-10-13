@@ -127,6 +127,11 @@ async def telegram_catchup():
     """Manually re-run the startup history catch-up (read-only)."""
     return await telegram_service.catchup_history()
 
+@app.post("/api/simulate/custom")
+async def run_custom_sim(req: CustomSimRequest):
+    target = MockSimulator.simulate_custom_text(req.text, req.channel)
+    return {"status": "ok", "target": target.model_dump() if target else None}
+
 @app.post("/api/simulate/{scenario}")
 async def run_scenario(scenario: str):
     if scenario == "ballistic":
@@ -146,11 +151,6 @@ async def run_scenario(scenario: str):
         return {"status": "ok", "target": target.model_dump()}
     else:
         raise HTTPException(status_code=400, detail="Unknown scenario")
-
-@app.post("/api/simulate/custom")
-async def run_custom_sim(req: CustomSimRequest):
-    target = MockSimulator.simulate_custom_text(req.text, req.channel)
-    return {"status": "ok", "target": target.model_dump() if target else None}
 
 @app.post("/api/clear")
 async def clear_radar():

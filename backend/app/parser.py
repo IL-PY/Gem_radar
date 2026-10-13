@@ -314,11 +314,13 @@ class ThreatParser:
         origin_explicit = False
         dest_explicit = False
 
-        # 1. Search for explicit origin
+        # 1. Search for explicit origin. Launches cannot come from free
+        # Ukrainian territory (occupied excepted), so only launch hubs
+        # count here — a Ukrainian city match is NOT a launch origin.
         origin_match = cls.RE_ORIGIN.search(text)
         if origin_match:
             chunk = origin_match.group(1)[:30]
-            origin = find_launch_origin(chunk) or find_geo_location(chunk)
+            origin = find_launch_origin(chunk)
             origin_explicit = origin is not None
 
         # 2. Search for explicit destination
@@ -396,7 +398,9 @@ class ThreatParser:
             trajectory = generate_curved_ballistic_arc(origin, dest, num_points=60)
             # Flight time in seconds (e.g. 350 km at 2000 m/s is ~175 sec / 3 mins)
             flight_time_sec = max(dist_km / (speed_kmh / 3600.0), 90.0)
-            launcher_pos = origin
+            # SPU marker only for an explicitly stated launch: an
+            # observed-point origin sits on free land and is NOT a launch.
+            launcher_pos = origin if origin_explicit else None
         elif threat_type == ThreatType.SHAHED:
             speed_kmh = 175.0   # ~48 m/s, propeller
             name = "БПЛА Shahed-136"

@@ -181,6 +181,20 @@ interface OblastMeta {
 /** Screen-space exaggeration so 100 km reads clearly at country zoom. */
 const ALT_PX_EXAGGERATION = 2.0;
 
+/** Max arc height as a fraction of the leg's on-screen length. Without
+ * this, close zoom turns every short hop into a giant take-off-and-
+ * landing loop (7000 m schematic lift vs tens of px of leg). */
+const MAX_LIFT_FRAC = 0.45;
+
+/** 0..1 shrink factor for a leg's 3D lift: full height on long legs,
+ * proportionally flattened on short ones, near-flat on dots. */
+function liftScaleFor(legScreenPx: number, maxLiftPx: number): number {
+  if (!(maxLiftPx > 0)) return 1;
+  if (!isFinite(legScreenPx) || legScreenPx < 0) return 1;
+  const cap = Math.max(legScreenPx, 8) * MAX_LIFT_FRAC;
+  return Math.min(1, cap / maxLiftPx);
+}
+
 /** Local flight progress 0..1 from wall clock (matches animation loop). */
 function progressOf(t: RadarTarget, nowS: number): number {
   const total = Math.max(t.eta_seconds, 1.0);
@@ -368,6 +382,8 @@ export const TacticalMap: React.FC<TacticalMapProps> = ({
     core: string;
     dash: number[];
     dashMult: number;
+    /** 0..1 shrink of the 3D lift so short legs don't loop sky-high. */
+    lift: number;
   }>>(new Map());
   const arcsDirtyRef = useRef<boolean>(true);
   const canvasSizeRef = useRef<{ w: number; h: number }>({ w: 0, h: 0 });
@@ -718,18 +734,18 @@ export const TacticalMap: React.FC<TacticalMapProps> = ({
         // Docs forbid drawing areaOnly as a place: hollow outline + region label.
         el.innerHTML = `
           <div class="flex flex-col items-center ${stale ? 'opacity-60' : ''}" title="${tip}">
-            <div class="w-3 h-3 rotate-45 border-2 border-dashed border-white/90 bg-transparent"></div>
-            <div class="px-1 mt-0.5 text-[9px] font-mono text-slate-200 bg-black/70 rounded whitespace-nowrap">${t.region || t.title}</div>
+            <div class="w-3.5 h-3.5 rotate-45 border-2 border-dashed border-white/90 bg-white/10 shadow-[0_0_10px_rgba(255,255,255,0.35)]"></div>
+            <div class="px-1.5 py-px mt-1 text-[10px] font-mono font-semibold tracking-wide text-slate-100 bg-black/85 backdrop-blur-sm rounded-md border border-white/15 whitespace-nowrap shadow-lg">${t.region || t.title}</div>
           </div>`;
       } else {
         const initScreenRot = (((t.heading ?? 0) - (map?.getBearing() ?? 0)) % 360 + 360) % 360;
         el.innerHTML = `
-          <div class="relative flex items-center justify-center w-8 h-8 ${stale ? 'opacity-60' : ''}" title="${tip}">
-            ${t.advisory ? '' : `<div class="nt-halo absolute inset-0 rounded-full ${sk.haloBg} opacity-60"></div>`}
-            <div class="nt-rotor z-10 flex items-center justify-center" style="transform: rotate(${initScreenRot.toFixed(0)}deg)">
-              <svg class="w-5 h-5" viewBox="0 0 24 24" style="filter:brightness(0) invert(1)">${sk.svgInner}</svg>
+          <div class="relative flex items-center justify-center w-9 h-9 ${stale ? 'opacity-60' : ''}" title="${tip}">
+            ${t.advisory ? '' : `<div class="nt-halo absolute inset-0 rounded-full ${sk.haloBg} opacity-70 ring-1 ring-white/25"></div>`}
+            <div class="nt-rotor z-10 flex items-center justify-center drop-shadow-[0_0_10px_rgba(255,255,255,0.55)]" style="transform: rotate(${initScreenRot.toFixed(0)}deg)">
+              <svg class="w-6 h-6 map-marker-svg" viewBox="0 0 24 24" style="filter:brightness(0) invert(1)">${sk.svgInner}</svg>
             </div>
-            ${t.count > 1 ? `<div class="absolute -bottom-1 -right-1 px-1 rounded bg-black/85 border border-slate-500 font-mono text-[9px] text-white font-bold">×${t.count}</div>` : ''}
+            ${t.count > 1 ? `<div class="absolute -bottom-1 -right-1 px-1.5 py-px rounded-md bg-black/90 border border-white/25 font-mono text-[10px] text-white font-bold shadow-lg">×${t.count}</div>` : ''}
           </div>`;
       }
 
@@ -747,11 +763,14 @@ export const TacticalMap: React.FC<TacticalMapProps> = ({
           const lEl = document.createElement('div');
           lEl.className = 'pointer-events-none select-none flex flex-col items-center';
           lEl.innerHTML = `
-            <div class="flex items-center space-x-1 px-1.5 py-0.5 rounded bg-black/85 border border-red-500/60 shadow text-[9px] font-mono text-red-300 whitespace-nowrap">
-              <span class="w-1.5 h-1.5 rounded-full bg-red-500 animate-ping"></span>
+            <div class="flex items-center space-x-1.5 px-2 py-1 rounded-lg bg-black/90 backdrop-blur-sm border border-red-400/60 shadow-[0_0_12px_rgba(239,68,68,0.35)] text-[10px] font-mono font-semibold tracking-wide text-red-200 whitespace-nowrap">
+              <span class="relative flex w-1.5 h-1.5">
+                <span class="absolute inline-flex w-full h-full rounded-full bg-red-500 opacity-75 animate-ping"></span>
+                <span class="relative inline-flex w-1.5 h-1.5 rounded-full bg-red-500"></span>
+              </span>
               <span>ПУСК: ${t.launch.name}</span>
             </div>
-            <div class="w-1.5 h-1.5 rounded-full bg-red-500 border border-white mt-0.5"></div>
+            <div class="w-2 h-2 rounded-full bg-red-500 border-2 border-white mt-1 shadow-[0_0_10px_rgba(239,68,68,1)]"></div>
           `;
           launchMarker = new maplibregl.Marker({ element: lEl })
             .setLngLat([t.launch.lon, t.launch.lat])
@@ -966,9 +985,9 @@ export const TacticalMap: React.FC<TacticalMapProps> = ({
             },
             paint: {
               'line-color': ['coalesce', ['get', 'color'], '#38bdf8'],
-              'line-width': 6,
-              'line-blur': 3,
-              'line-opacity': 0.5,
+              'line-width': 7,
+              'line-blur': 2,
+              'line-opacity': 0.55,
             },
           },
           {
@@ -981,8 +1000,8 @@ export const TacticalMap: React.FC<TacticalMapProps> = ({
             },
             paint: {
               'line-color': ['coalesce', ['get', 'color'], '#38bdf8'],
-              'line-width': 2.5,
-              'line-opacity': 0.9,
+              'line-width': 3,
+              'line-opacity': 0.95,
               'line-dasharray': [3, 2],
             },
           },
@@ -997,9 +1016,9 @@ export const TacticalMap: React.FC<TacticalMapProps> = ({
             },
             paint: {
               'line-color': ['coalesce', ['get', 'color'], '#38bdf8'],
-              'line-width': 6,
-              'line-blur': 3,
-              'line-opacity': 0.5,
+              'line-width': 7,
+              'line-blur': 2,
+              'line-opacity': 0.55,
             },
           },
           {
@@ -1012,8 +1031,8 @@ export const TacticalMap: React.FC<TacticalMapProps> = ({
             },
             paint: {
               'line-color': ['coalesce', ['get', 'color'], '#38bdf8'],
-              'line-width': 2.5,
-              'line-opacity': 0.9,
+              'line-width': 3,
+              'line-opacity': 0.95,
             },
           },
         ],
@@ -1113,14 +1132,13 @@ export const TacticalMap: React.FC<TacticalMapProps> = ({
     // lifted arc in 3D, full brightness in 2D.
     try {
       const dim = viewMode === '3D';
-      map.setPaintProperty('neptun-trajectories-glow-layer', 'line-width', dim ? 4 : 6);
-      map.setPaintProperty('neptun-trajectories-glow-layer', 'line-opacity', dim ? 0.25 : 0.5);
-      map.setPaintProperty('neptun-trajectories-core-layer', 'line-width', dim ? 1.5 : 2.5);
-      map.setPaintProperty('neptun-trajectories-core-layer', 'line-opacity', dim ? 0.4 : 0.9);
-      map.setPaintProperty('neptun-history-glow-layer', 'line-width', dim ? 4 : 6);
-      map.setPaintProperty('neptun-history-glow-layer', 'line-opacity', dim ? 0.25 : 0.5);
-      map.setPaintProperty('neptun-history-core-layer', 'line-width', dim ? 1.5 : 2.5);
-      map.setPaintProperty('neptun-history-core-layer', 'line-opacity', dim ? 0.4 : 0.9);
+      map.setPaintProperty('neptun-trajectories-glow-layer', 'line-width', dim ? 5 : 7);
+      map.setPaintProperty('neptun-trajectories-core-layer', 'line-width', dim ? 2 : 3);
+      map.setPaintProperty('neptun-trajectories-core-layer', 'line-opacity', dim ? 0.4 : 0.95);
+      map.setPaintProperty('neptun-history-glow-layer', 'line-width', dim ? 5 : 7);
+      map.setPaintProperty('neptun-history-glow-layer', 'line-opacity', dim ? 0.25 : 0.55);
+      map.setPaintProperty('neptun-history-core-layer', 'line-width', dim ? 2 : 3);
+      map.setPaintProperty('neptun-history-core-layer', 'line-opacity', dim ? 0.4 : 0.95);
     } catch {
       // Style/layers not ready yet — defaults in the style apply.
     }
@@ -1261,10 +1279,11 @@ export const TacticalMap: React.FC<TacticalMapProps> = ({
         const missileEl = document.createElement('div');
         missileEl.className = 'cursor-pointer select-none';
         missileEl.innerHTML = `
-          <div class="relative flex items-center justify-center w-10 h-10">
+          <div class="relative flex items-center justify-center w-11 h-11">
             <div class="absolute inset-0 rounded-full ${skin.haloBg} radar-ping"></div>
+            <div class="absolute inset-1 rounded-full ring-1 ring-white/25"></div>
             <div class="missile-rotor z-10 flex items-center justify-center ${skin.rotorShadow}" style="transform: rotate(${initScreenRot.toFixed(1)}deg); transition: transform 0.3s linear;">
-              <svg class="w-6 h-6" viewBox="0 0 24 24">${skin.svgInner}</svg>
+              <svg class="w-7 h-7 map-marker-svg" viewBox="0 0 24 24">${skin.svgInner}</svg>
             </div>
           </div>
         `;
@@ -1303,10 +1322,12 @@ export const TacticalMap: React.FC<TacticalMapProps> = ({
         const dEl = document.createElement('div');
         dEl.innerHTML = `
           <div class="relative flex flex-col items-center select-none">
-            <div class="w-3.5 h-3.5 bg-rose-500 border-2 border-white rounded-full animate-ping"></div>
-            <div class="w-3 h-3 -mt-3.5 bg-rose-600 border-2 border-white rounded-full"></div>
-            <div class="px-2 py-0.5 mt-1 text-[10px] font-mono font-black text-white uppercase bg-black/85 border border-rose-500/80 rounded tracking-wider shadow whitespace-nowrap">
-              🎯 ${target.destination.name}
+            <div class="relative flex items-center justify-center w-5 h-5">
+              <div class="absolute inline-flex w-full h-full rounded-full bg-rose-500 opacity-60 animate-ping"></div>
+              <div class="relative w-3.5 h-3.5 bg-gradient-to-br from-rose-400 to-rose-700 border-2 border-white rounded-full shadow-[0_0_12px_rgba(244,63,94,0.9)]"></div>
+            </div>
+            <div class="px-2.5 py-1 mt-1.5 text-[11px] font-mono font-bold text-white uppercase bg-black/90 backdrop-blur-sm border border-rose-400/70 rounded-lg tracking-wider shadow-[0_0_14px_rgba(244,63,94,0.35)] whitespace-nowrap">
+              ЦІЛЬ · ${target.destination.name}
             </div>
           </div>
         `;
@@ -1316,7 +1337,7 @@ export const TacticalMap: React.FC<TacticalMapProps> = ({
 
         // Altitude Badge
         const altBadgeEl = document.createElement('div');
-        altBadgeEl.className = `pointer-events-none select-none px-2 py-0.5 rounded bg-black/80 border ${skin.badgeBorder} font-mono text-[10px] text-white font-bold whitespace-nowrap shadow-md`;
+        altBadgeEl.className = `pointer-events-none select-none px-2 py-1 rounded-lg bg-black/90 backdrop-blur-sm border ${skin.badgeBorder} font-mono text-[11px] tabular-nums text-white font-bold whitespace-nowrap shadow-lg`;
         altBadgeEl.id = `alt-badge-${target.id}`;
         altBadgeEl.innerText = target.threat_type === 'BALLISTIC' ? 'ВИС: 0 км' : 'ВИС: 1 км';
 
@@ -1358,16 +1379,25 @@ export const TacticalMap: React.FC<TacticalMapProps> = ({
         const arc = target.trajectory_arc;
         const n = arc.length;
         const skin = skinOf(target.threat_type);
-        const path = new Path2D();
+        // Two passes: project first, then scale the lift to the leg's
+        // on-screen size so short hops stay near-flat in 3D.
+        const sp: { x: number; y: number; liftPx: number }[] = [];
         for (let i = 0; i < n; i++) {
           const lat = arc[i][0];
           const lon = arc[i][1];
           const p = map.project([lon, lat]);
           const alt = visualAltAt(i / (n - 1), target.threat_type);
           const mp = (Math.cos((lat * Math.PI) / 180) * 40075016) / (256 * Math.pow(2, zoom));
-          const yOff = in3D ? ((alt / mp) * sinP * ALT_PX_EXAGGERATION) : 0;
-          if (i === 0) path.moveTo(p.x, p.y - yOff);
-          else path.lineTo(p.x, p.y - yOff);
+          sp.push({ x: p.x, y: p.y, liftPx: in3D ? ((alt / mp) * sinP * ALT_PX_EXAGGERATION) : 0 });
+        }
+        const legPx = Math.hypot(sp[n - 1].x - sp[0].x, sp[n - 1].y - sp[0].y);
+        const maxLift = sp.reduce((m, q) => Math.max(m, q.liftPx), 0);
+        const liftK = liftScaleFor(legPx, maxLift);
+        const path = new Path2D();
+        for (let i = 0; i < n; i++) {
+          const y = sp[i].y - sp[i].liftPx * liftK;
+          if (i === 0) path.moveTo(sp[i].x, y);
+          else path.lineTo(sp[i].x, y);
         }
 
         // Per-type stroke character: ballistic/KAB solid lifted arcs,
@@ -1379,7 +1409,7 @@ export const TacticalMap: React.FC<TacticalMapProps> = ({
         else if (target.threat_type === 'CRUISE_MISSILE') { dash = [16, 9]; dashMult = 1.5; }
         else if (target.threat_type === 'RECON_UAV') { dash = [2, 7]; dashMult = 0.45; }
         const cc = colorOverrideRef.current.get(target.id);
-        cache.set(target.id, { path, glow: cc ?? skin.overlayGlow, core: cc ? '#f8fafc' : skin.overlayCore, dash, dashMult });
+        cache.set(target.id, { path, glow: cc ?? skin.overlayGlow, core: cc ? '#f8fafc' : skin.overlayCore, dash, dashMult, lift: liftK });
       }
       // NEPTUN live tracks: same lifted treatment as simulation arcs.
       // Backend sends a dense forward track (live fix -> dest); vertical
@@ -1401,20 +1431,27 @@ export const TacticalMap: React.FC<TacticalMapProps> = ({
         if (!in3D && (key === 'BALLISTIC' || key === 'KAB')) continue;
         const skin = skinOf(key);
         const n = traj.length;
-        const path = new Path2D();
+        const sp: { x: number; y: number; liftPx: number }[] = [];
         for (let i = 0; i < n; i++) {
           const lat = traj[i][0];
           const lon = traj[i][1];
           const p = map.project([lon, lat]);
           const alt = visualAltAt(neptunProgress(nt, i / (n - 1)), key);
           const mp = (Math.cos((lat * Math.PI) / 180) * 40075016) / (256 * Math.pow(2, zoom));
-          const yOff = in3D ? ((alt / mp) * sinP * ALT_PX_EXAGGERATION) : 0;
-          if (i === 0) path.moveTo(p.x, p.y - yOff);
-          else path.lineTo(p.x, p.y - yOff);
+          sp.push({ x: p.x, y: p.y, liftPx: in3D ? ((alt / mp) * sinP * ALT_PX_EXAGGERATION) : 0 });
+        }
+        const legPx = Math.hypot(sp[n - 1].x - sp[0].x, sp[n - 1].y - sp[0].y);
+        const maxLift = sp.reduce((m, q) => Math.max(m, q.liftPx), 0);
+        const liftK = liftScaleFor(legPx, maxLift);
+        const path = new Path2D();
+        for (let i = 0; i < n; i++) {
+          const y = sp[i].y - sp[i].liftPx * liftK;
+          if (i === 0) path.moveTo(sp[i].x, y);
+          else path.lineTo(sp[i].x, y);
         }
         const { dash, dashMult } = neptunDashFor(key);
         const cc = colorOverrideRef.current.get(`neptun-${nt.id}`);
-        cache.set(`neptun-${nt.id}`, { path, glow: cc ?? skin.overlayGlow, core: cc ? '#f8fafc' : skin.overlayCore, dash, dashMult });
+        cache.set(`neptun-${nt.id}`, { path, glow: cc ?? skin.overlayGlow, core: cc ? '#f8fafc' : skin.overlayCore, dash, dashMult, lift: liftK });
       }
       // NOTE: flown history is intentionally not drawn — forecast only.
       arcsDirtyRef.current = false;
@@ -1430,8 +1467,8 @@ export const TacticalMap: React.FC<TacticalMapProps> = ({
       const w = parent ? parent.clientWidth : canvas.clientWidth;
       const h = parent ? parent.clientHeight : canvas.clientHeight;
       if (w < 1 || h < 1) return false;
-      // Low mode renders at dpr 1: quarter pixels to stroke when crowded.
-      const dprCap = perfModeRef.current === 0 ? 1 : 2;
+      // Low mode renders at dpr 1.5: still crisp on hidpi, less fill-rate.
+      const dprCap = perfModeRef.current === 0 ? 1.5 : 2;
       const dpr = Math.min(window.devicePixelRatio || 1, dprCap);
       const prev = canvasSizeRef.current;
       if (prev.w !== w || prev.h !== h || (canvas as any)._dpr !== dpr) {
@@ -1487,7 +1524,7 @@ export const TacticalMap: React.FC<TacticalMapProps> = ({
         ctx.save();
         ctx.globalAlpha = 0.95;
         ctx.strokeStyle = e.core;
-        ctx.lineWidth = 3;
+        ctx.lineWidth = 3.5;
         ctx.lineCap = 'round';
         ctx.lineJoin = 'round';
         ctx.setLineDash(e.dash);
@@ -1596,8 +1633,10 @@ export const TacticalMap: React.FC<TacticalMapProps> = ({
         const liftable = in3D && sinP >= 0.05;
         const metersPerPixel = (lat: number) =>
           (Math.cos((lat * Math.PI) / 180) * 40075016) / (256 * Math.pow(2, zoom));
+        // Same shrink the drawn arc got (short legs stay near-flat).
+        const liftK = arcCacheRef.current.get(target.id)?.lift ?? 1;
         const liftOf = (lat: number, altM: number) =>
-          liftable ? (altM / metersPerPixel(lat)) * sinP * ALT_PX_EXAGGERATION : 0;
+          liftable ? ((altM / metersPerPixel(lat)) * sinP * ALT_PX_EXAGGERATION * liftK) : 0;
         const yOffPx = liftOf(currLat, currVisMeters);
         try {
           markers.missileMarker.setOffset([0, -yOffPx]);
@@ -1717,8 +1756,9 @@ export const TacticalMap: React.FC<TacticalMapProps> = ({
           // Progress of the snapped fix along the forward arc, mapped to
           // full-flight progress for the altitude profile.
           const prog = neptunProgress(t, frac ?? 0);
+          const liftK = arcCacheRef.current.get(`neptun-${t.id}`)?.lift ?? 1;
           const yOffHere = liftable
-            ? ((visualAltAt(prog, key) / mpp(mLat)) * sinP * ALT_PX_EXAGGERATION)
+            ? ((visualAltAt(prog, key) / mpp(mLat)) * sinP * ALT_PX_EXAGGERATION * liftK)
             : 0;
           try {
             rec.marker.setOffset([0, -yOffHere]);
@@ -1732,7 +1772,7 @@ export const TacticalMap: React.FC<TacticalMapProps> = ({
             const nxt = traj[nxtIdx];
             const progN = neptunProgress(t, nxtIdx / (traj.length - 1));
             const yOffNext = liftable
-              ? ((visualAltAt(progN, key) / mpp(nxt[0])) * sinP * ALT_PX_EXAGGERATION)
+              ? ((visualAltAt(progN, key) / mpp(nxt[0])) * sinP * ALT_PX_EXAGGERATION * liftK)
               : 0;
             const pc = map.project([mLon, mLat]);
             const pn = map.project([nxt[1], nxt[0]]);
@@ -1768,10 +1808,10 @@ export const TacticalMap: React.FC<TacticalMapProps> = ({
       <div className="absolute top-16 left-4 z-20 flex items-center space-x-1.5 p-1 rounded-lg bg-black/80 backdrop-blur-md border border-slate-800 shadow-xl font-mono text-xs">
         <button
           onClick={onToggleViewMode}
-          className={`flex items-center space-x-1.5 px-3 py-1.5 rounded transition-all font-bold ${
+          className={`flex items-center space-x-1.5 px-3 py-1.5 rounded-lg transition-all font-bold tracking-wide ${
             viewMode === '2D'
-              ? 'bg-sky-600 text-white shadow-sm'
-              : 'text-slate-400 hover:text-white hover:bg-slate-800'
+              ? 'bg-sky-500 text-white shadow-[0_0_16px_rgba(56,189,248,0.5)]'
+              : 'text-slate-400 hover:text-white hover:bg-white/[0.07]'
           }`}
         >
           <Layers className="w-3.5 h-3.5" />
@@ -1780,10 +1820,10 @@ export const TacticalMap: React.FC<TacticalMapProps> = ({
 
         <button
           onClick={onToggleViewMode}
-          className={`flex items-center space-x-1.5 px-3 py-1.5 rounded transition-all font-bold ${
+          className={`flex items-center space-x-1.5 px-3 py-1.5 rounded-lg transition-all font-bold tracking-wide ${
             viewMode === '3D'
-              ? 'bg-rose-600 text-white shadow-lg shadow-rose-900/40 animate-pulse'
-              : 'text-slate-400 hover:text-white hover:bg-slate-800'
+              ? 'bg-gradient-to-b from-rose-500 to-rose-700 text-white shadow-[0_0_18px_rgba(244,63,94,0.5)]'
+              : 'text-slate-400 hover:text-white hover:bg-white/[0.07]'
           }`}
         >
           <Compass className="w-3.5 h-3.5" />
@@ -1792,22 +1832,22 @@ export const TacticalMap: React.FC<TacticalMapProps> = ({
       </div>
 
       {/* Raion alert levels (neptun.in.ua) */}
-      <div className="absolute bottom-6 left-4 z-20 px-3 py-2 rounded-lg bg-black/80 backdrop-blur-md border border-slate-800 shadow-xl font-mono text-[11px] space-y-1">
-        <div className="text-slate-400 font-bold tracking-wider uppercase text-[10px]">Тривоги по районах</div>
+      <div className="absolute bottom-6 left-4 z-20 px-3.5 py-2.5 rounded-xl bg-gradient-to-b from-slate-900/90 to-black/90 backdrop-blur-xl border border-white/10 shadow-[0_16px_48px_rgba(0,0,0,0.6)] font-mono text-[11px] space-y-1.5">
+        <div className="text-slate-300 font-bold tracking-[0.14em] uppercase text-[10px]">Тривоги по районах</div>
         <div className="flex items-center space-x-4">
           <span className="flex items-center space-x-1.5">
-            <span className="w-2.5 h-2.5 rounded-sm bg-red-500 shadow-[0_0_8px_rgba(239,68,68,0.9)]" />
-            <span className="text-red-300 font-bold">Тривога{oblastMeta ? ` · ${oblastMeta.red}` : ''}</span>
+            <span className="w-3 h-3 rounded-[4px] bg-gradient-to-br from-red-400 to-red-600 shadow-[0_0_10px_rgba(239,68,68,0.9)]" />
+            <span className="text-red-300 font-bold tabular-nums">Тривога{oblastMeta ? ` · ${oblastMeta.red}` : ''}</span>
           </span>
           <span className="flex items-center space-x-1.5">
-            <span className="w-2.5 h-2.5 rounded-sm bg-yellow-400 shadow-[0_0_8px_rgba(250,204,21,0.9)]" />
-            <span className="text-yellow-200 font-bold">Загроза{oblastMeta ? ` · ${oblastMeta.yellow}` : ''}</span>
+            <span className="w-3 h-3 rounded-[4px] bg-gradient-to-br from-yellow-300 to-yellow-500 shadow-[0_0_10px_rgba(250,204,21,0.9)]" />
+            <span className="text-yellow-200 font-bold tabular-nums">Загроза{oblastMeta ? ` · ${oblastMeta.yellow}` : ''}</span>
           </span>
         </div>
         <div className="text-slate-500 text-[10px]">
           {oblastMeta ? `оновлено ${new Date(oblastMeta.updatedAt).toLocaleTimeString('uk-UA')} · neptun.in.ua` : 'завантаження рівнів…'}
         </div>
-        <div className="text-slate-400 text-[10px] pt-0.5 mt-0.5 border-t border-slate-800">
+        <div className="text-slate-400 text-[10px] pt-1 mt-0.5 border-t border-white/10">
           {neptunMeta ? `NEPTUN live: ${neptunMeta.active} треків` : 'NEPTUN live: …'}
           {' · '}
           <a href="https://neptun.in.ua/" target="_blank" rel="noreferrer" className="text-sky-400 hover:text-sky-300 underline">
