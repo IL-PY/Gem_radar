@@ -220,6 +220,9 @@ def generate_linear_waypoints(
     to the flight path) so low-altitude threats don't fly laser-straight:
     Shaheds wander between landmarks, cruise missiles dog-leg. One full
     lateral swing spans roughly weave_deg*111 km peak-to-peak.
+
+    The weave scales to the leg length: a fixed cycle count draws wild
+    loops on short final legs, so short legs get fewer, smaller swings.
     """
     # Perpendicular unit normal to the flight direction
     d_lat = dest.lat - origin.lat
@@ -230,13 +233,17 @@ def generate_linear_waypoints(
     else:
         n_lat, n_lon = 0.0, 0.0
 
+    leg_km = haversine_distance_km(origin, dest)
+    eff_cycles = min(weave_cycles, max(0.6, leg_km / 150.0))
+    eff_weave = min(weave_deg, norm_len * 0.06)
+
     coords: List[List[float]] = []
     for i in range(num_points + 1):
         t = i / float(num_points)
         lat = origin.lat + (dest.lat - origin.lat) * t
         lon = origin.lon + (dest.lon - origin.lon) * t
-        if weave_deg > 0:
-            w = weave_deg * math.sin(2.0 * math.pi * weave_cycles * t)
+        if eff_weave > 0:
+            w = eff_weave * math.sin(2.0 * math.pi * eff_cycles * t)
             lat += n_lat * w
             lon += n_lon * w
         coords.append([round(lat, 5), round(lon, 5)])

@@ -132,23 +132,39 @@ def _weave_leg(
     return pts
 
 
+def _scaled_weave(
+    weave_deg: float, weave_cycles: float,
+    lat0: float, lon0: float, lat1: float, lon1: float,
+) -> Tuple[float, float]:
+    """Scale the S-weave to the leg length.
+
+    A fixed cycle count looks gentle on a 300 km leg but draws wild loops
+    on a 40 km final leg into the target. One full swing per ~150 km and
+    lateral amplitude capped at ~6% of the leg length instead.
+    """
+    leg_km = _haversine(lat0, lon0, lat1, lon1)
+    deg_len = math.hypot(lat1 - lat0, lon1 - lon0)
+    cycles = min(weave_cycles, max(0.6, leg_km / 150.0))
+    amp = min(weave_deg, deg_len * 0.06)
+    return amp, cycles
+
+
 def build_forward_trajectory(
     current: Tuple[float, float],
     dest: Tuple[float, float],
     family: str,
     speed_kmh: Optional[float] = None,
     full_dist_km: float = 0.0,
+    num_points: int = TRAJECTORY_POINTS + 1,
 ) -> List[List[float]]:
-    """Dense CURRENT -> DEST ground track (the future path only).
+    """Dense A -> B ground track in the direction of flight.
 
-    The flown leg (launch -> current) is reconstructed guesswork and, drawn
-    for every one of 20+ swarm tracks from the same launch area, turns the
-    map into unreadable spaghetti of giant triangles. The origin stays
-    visible via the launch marker. Shape mirrors the simulator: ballistic
+    Used for both the expected path (live fix -> dest) and the flown
+    history (launch -> live fix). Shape mirrors the simulator: ballistic
     Bezier sweep for BALLISTIC / MIG31K, short straight glide for KAB,
     S-weave for SHAHED / cruise / recon.
     """
-    n = TRAJECTORY_POINTS + 1
+    n = max(num_points, 2)
     c_lat, c_lon = current
     d_lat, d_lon = dest
     fam = (family or "").upper()
@@ -167,6 +183,7 @@ def build_forward_trajectory(
             weave, cycles = 0.09, 2.5
         else:
             weave, cycles = 0.05, 2.0
+        weave, cycles = _scaled_weave(weave, cycles, c_lat, c_lon, d_lat, d_lon)
         leg = _weave_leg(c_lat, c_lon, d_lat, d_lon, n, weave, cycles)
 
     return [[round(la, 5), round(lo, 5)] for la, lo in leg]
@@ -414,14 +431,21 @@ class NeptunThreatsService:
                         "name": d_name,
                     }
                 # 3. Dense forward track (live fix -> dest) + flown fraction
-                # for the frontend altitude profile.
+                # for the frontend altitude profile. Plus the flown history
+                # (launch -> live fix) drawn solid in the same color.
                 flown_km = _haversine(l_lat, l_lon, lat_f, lon_f)
                 remain_km = _haversine(lat_f, lon_f, d_lat, d_lon)
                 full_km = flown_km + remain_km
                 progress_base = (flown_km / full_km) if full_km > 0 else 0.0
+                family = TYPE_MAP.get(ntype, "UNKNOWN")
                 expected_trajectory = build_forward_trajectory(
                     (lat_f, lon_f), (d_lat, d_lon),
-                    TYPE_MAP.get(ntype, "UNKNOWN"), speed, full_km,
+                    family, speed, full_km,
+                )
+                flown_trajectory = build_forward_trajectory(
+                    (l_lat, l_lon), (lat_f, lon_f),
+                    family, speed, full_km,
+                    num_points=TRAJECTORY_POINTS // 2 + 1,
                 )
 
             out.append({
@@ -451,6 +475,7 @@ class NeptunThreatsService:
                 "launch": launch_info,
                 "destination": dest_info,
                 "expectedTrajectory": expected_trajectory,
+                "flownTrajectory": flown_trajectory if effective_bearing is not None else [],
                 "progressBase": round(progress_base, 4) if effective_bearing is not None else None,
             })
         return out

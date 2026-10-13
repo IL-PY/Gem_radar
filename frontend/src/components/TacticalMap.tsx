@@ -116,22 +116,20 @@ function neptunDashFor(key: string): { dash: number[]; dashMult: number } {
 }
 
 // ---------------------------------------------------------------------------
-// Swarm disambiguation: when MORE than CLUSTER_MIN_COUNT live tracks bunch
-// within CLUSTER_RADIUS_PX on screen, every track of the bunch gets its own
-// distinct color (marker chip + trajectory) so you can tell which flies
-// where. Below the threshold everything keeps its per-type palette.
+// Persistent per-track colors: EVERY live track (simulation + NEPTUN) keeps
+// its own distinct color for its whole lifetime — stable across zoom and
+// time, so you can always tell which flies where. The first track of a
+// kind keeps its per-type palette color; duplicates take overflow colors.
 // ---------------------------------------------------------------------------
-const CLUSTER_RADIUS_PX = 150;
-const CLUSTER_MIN_COUNT = 3;
-const CLUSTER_PALETTE = [
+const OVERFLOW_PALETTE = [
   '#22d3ee', // cyan
-  '#f472b6', // pink
+  '#e879f9', // fuchsia
   '#a3e635', // lime
-  '#fb923c', // orange
   '#facc15', // yellow
-  '#a78bfa', // violet
-  '#34d399', // emerald
   '#f8fafc', // white
+  '#f472b6', // pink
+  '#2dd4bf', // teal
+  '#a5b4fc', // light indigo
 ];
 
 /** Paint (or clear, when color is null) the cluster chip on a sim marker. */
@@ -215,6 +213,8 @@ export interface NeptunThreat {
   launch?: { lat: number; lon: number; name: string } | null;
   destination?: { lat: number; lon: number; name: string } | null;
   expectedTrajectory?: number[][];
+  /** Flown history (launch -> live fix), drawn solid in the same color. */
+  flownTrajectory?: number[][];
   /** Flown fraction of the full launch->dest flight (backend estimate).
    * The trajectory itself is forward-only (live fix -> dest). */
   progressBase?: number | null;
@@ -258,6 +258,74 @@ function neptunProgress(t: NeptunThreat, frac: number): number {
   return Math.min(Math.max(base + (1 - base) * f, 0), 1);
 }
 
+/** Snap a dead-reckoned fix onto the displayed trajectory (segment
+ * projection, equirectangular with cos(lat) lon weight). Returns the
+ * snapped point + its 0..1 fraction along the arc, or null without a track.
+ * Keeps the marker glued to its line even when reported heading drifts
+ * off the drawn arc. */
+function snapToTraj(lat: number, lon: number, traj: number[][]): { lat: number; lon: number; frac: number } | null {
+  if (!traj || traj.length < 2) return null;
+  const cosLat = Math.max(Math.cos((lat * Math.PI) / 180), 0.2);
+  let best: { d: number; la: number; lo: number; frac: number } | null = null;
+  for (let i = 0; i < traj.length - 1; i++) {
+    const ax = (traj[i][1] - lon) * cosLat;
+    const ay = traj[i][0] - lat;
+    const dx = (traj[i + 1][1] - traj[i][1]) * cosLat;
+    const dy = traj[i + 1][0] - traj[i][0];
+    const len2 = dx * dx + dy * dy;
+    let s = len2 > 0 ? -(ax * dx + ay * dy) / len2 : 0;
+    s = Math.min(Math.max(s, 0), 1);
+    const px = ax + dx * s;
+    const py = ay + dy * s;
+    const d = px * px + py * py;
+    if (!best || d < best.d) {
+      best = { d, la: lat + py, lo: lon + px / cosLat, frac: (i + s) / (traj.length - 1) };
+    }
+  }
+  return best ? { lat: best.la, lon: best.lo, frac: best.frac } : null;
+}
+
+/** Rigid-shift a track by (dLat, dLon) degrees. Used to anchor static
+ * fetch-time arcs to the plane's live coordinates (dead-reckoning delta),
+ * so the marker always sits exactly on the history->forward junction. */
+function shiftTraj(traj: number[][], dLat: number, dLon: number): number[][] {
+  if (!dLat && !dLon) return traj;
+  return traj.map((pt) => [pt[0] + dLat, pt[1] + dLon]);
+}
+
+/** Max dead-reckoning shift applied to drawn arcs (km). Beyond this the
+ * upstream fix is considered stale and arcs stay as fetched. */
+const LIVE_SHIFT_CAP_KM = 30;
+
+/** Rigid shift anchoring fetch-time arcs to the plane's live coordinates.
+ * Returns {0,0} when there is nothing to anchor or the fix looks stale. */
+function neptunShift(t: NeptunThreat, live: { lat: number; lon: number }): { dLa: number; dLo: number } {
+  const fwd = t.expectedTrajectory;
+  const hist = t.flownTrajectory;
+  const anchor = (fwd && fwd.length >= 2)
+    ? fwd[0]
+    : (hist && hist.length >= 2 ? hist[hist.length - 1] : null);
+  if (!anchor) return { dLa: 0, dLo: 0 };
+  const dLa = live.lat - anchor[0];
+  const dLo = live.lon - anchor[1];
+  if ((dLa !== 0 || dLo !== 0) && Math.hypot(dLa, dLo) * 111 <= LIVE_SHIFT_CAP_KM) {
+    return { dLa, dLo };
+  }
+  return { dLa: 0, dLo: 0 };
+}
+
+/** Point at 0..1 fraction along a track (linear interp between vertices). */
+function pointAtFrac(traj: number[][], frac: number): { lat: number; lon: number } {
+  const n = traj.length;
+  const f = Math.min(Math.max(frac, 0), 1) * (n - 1);
+  const i = Math.min(Math.floor(f), n - 2);
+  const s = f - i;
+  return {
+    lat: traj[i][0] + (traj[i + 1][0] - traj[i][0]) * s,
+    lon: traj[i][1] + (traj[i + 1][1] - traj[i][1]) * s,
+  };
+}
+
 /** Parse confirmedAt once (fetch cadence), cache per id for the frame loop. */
 function parseNeptunTime(t: NeptunThreat): number | null {
   if (!t.confirmedAt) return null;
@@ -289,6 +357,7 @@ export const TacticalMap: React.FC<TacticalMapProps> = ({
     svgEl: Element | null;
     badgeEl: HTMLElement | null;
     lastBadgeText: string;
+    culled?: boolean;
   }>>(new Map());
 
   // Lifted-arc overlay cache: static ground projections are re-projected
@@ -326,14 +395,24 @@ export const TacticalMap: React.FC<TacticalMapProps> = ({
     sig: string;
     rotorEl: HTMLElement | null;
     haloEl: HTMLElement | null;
+    culled?: boolean;
   }>>(new Map());
   const [neptunMeta, setNeptunMeta] = useState<{ count: number; active: number; updatedAt: number } | null>(null);
 
-  // Swarm disambiguation colors: overlay-cache key -> palette color.
+  // Persistent per-track color overrides: overlay-cache key -> color.
   // Sim targets keyed by target.id, NEPTUN by `neptun-${id}`.
-  const clusterColorRef = useRef<Map<string, string>>(new Map());
+  // Absent = per-type palette color. Assigned once, stable for life.
+  const colorOverrideRef = useRef<Map<string, string>>(new Map());
+  // Last live (dead-reckoned) NEPTUN fixes, written every frame by the tick.
+  // Ground pushes AND overlay rebuilds anchor drawn arcs to THIS value
+  // (single clock) instead of each sampling wall time — otherwise ground,
+  // overlay and marker end up with three different junctions.
+  const liveFixRef = useRef<Map<string, { lat: number; lon: number }>>(new Map());
   const frameRef = useRef<number>(0);
-  const [clusterMeta, setClusterMeta] = useState<{ groups: number; total: number }>({ groups: 0, total: 0 });
+  // Adaptive overlay quality by live-track count: 2 = full (60fps, dpr<=2,
+  // glow+core), 1 = medium (30fps), 0 = low (20fps, dpr 1, core only).
+  // Recomputed on the ~2Hz throttle; canvas work dominates when crowded.
+  const perfModeRef = useRef<number>(2);
 
   // Push NEPTUN trajectories GeoJSON lines to map
   const pushNeptunTrajectories = () => {
@@ -342,20 +421,34 @@ export const TacticalMap: React.FC<TacticalMapProps> = ({
     try {
       const src = map.getSource('neptun-trajectories') as maplibregl.GeoJSONSource | undefined;
       if (!src) return;
+      const nowMs = Date.now();
       const features: any[] = [];
       neptunRef.current.forEach((t) => {
         if (t.status !== 'active' || t.areaOnly) return;
         // Same palette as the simulation targets of the same kind,
         // or the swarm-disambiguation color when bunched.
         const base = skinOf(neptunLiftKey(t.family, t.speedKmh)).groundGlow;
-        const color = clusterColorRef.current.get(`neptun-${t.id}`) ?? base;
-        if (t.expectedTrajectory && t.expectedTrajectory.length >= 2) {
+        const color = colorOverrideRef.current.get(`neptun-${t.id}`) ?? base;
+        let fwd = t.expectedTrajectory;
+        // Anchor the forecast arc to the plane's live fix from the SINGLE
+        // shared clock (liveFixRef, written every frame by the tick).
+        // NOTE: flown history ("the past") is intentionally not drawn —
+        // only the predicted path stays on the map.
+        {
+          const live = liveFixRef.current.get(t.id)
+            ?? predictNeptun(t, nowMs, neptunTimeRef.current.get(t.id) ?? null);
+          const sh = neptunShift(t, live);
+          if (sh.dLa !== 0 || sh.dLo !== 0) {
+            if (fwd && fwd.length >= 2) fwd = shiftTraj(fwd, sh.dLa, sh.dLo);
+          }
+        }
+        if (fwd && fwd.length >= 2) {
           features.push({
             type: 'Feature',
             properties: { id: `nt-traj-${t.id}`, color },
             geometry: {
               type: 'LineString',
-              coordinates: t.expectedTrajectory.map((pt) => [pt[1], pt[0]]),
+              coordinates: fwd.map((pt) => [pt[1], pt[0]]),
             },
           });
         }
@@ -364,98 +457,80 @@ export const TacticalMap: React.FC<TacticalMapProps> = ({
         type: 'FeatureCollection',
         features,
       });
+      // History source stays empty: only the forecast is drawn.
+      const histSrc = map.getSource('neptun-history') as maplibregl.GeoJSONSource | undefined;
+      if (histSrc) {
+        histSrc.setData({
+          type: 'FeatureCollection',
+          features: [],
+        });
+      }
     } catch (e) {
       console.warn('[Map] neptun trajectory push failed', e);
     }
   };
 
-  // Swarm disambiguation pass (throttled ~2Hz from the frame loop).
-  // Projects every live track to screen space, groups connected tracks
-  // within CLUSTER_RADIUS_PX, and paints bunches larger than
-  // CLUSTER_MIN_COUNT in distinct palette colors (chip + trajectory).
-  const updateClusters = () => {
-    const map = mapRef.current;
-    if (!map) return;
+  // Persistent per-track colors (runs on the ~2Hz throttle; early-outs when
+  // nothing changed). No screen math at all: colors are assigned once per
+  // track lifetime, so they survive zoom/pan Flights. First track of a kind
+  // keeps its per-type palette color; duplicates take overflow colors.
+  const assignTrackColors = () => {
     const nowS = Date.now() / 1000;
-    const nowMs = nowS * 1000;
-    const pts: { key: string; x: number; y: number }[] = [];
+    const order: { key: string; base: string }[] = [];
+    targetsRef.current
+      .filter((t) => t.trajectory_arc && t.trajectory_arc.length >= 2 && progressOf(t, nowS) < 1)
+      .map((t) => t.id)
+      .sort()
+      .forEach((id) => {
+        const t = targetsRef.current.find((x) => x.id === id);
+        if (t) order.push({ key: id, base: skinOf(t.threat_type).groundGlow });
+      });
+    neptunRef.current
+      .filter((t) => t.status === 'active' && !t.areaOnly && t.expectedTrajectory && t.expectedTrajectory.length >= 2)
+      .map((t) => t.id)
+      .sort()
+      .forEach((id) => {
+        const t = neptunRef.current.find((x) => x.id === id);
+        if (t) order.push({ key: `neptun-${id}`, base: skinOf(neptunLiftKey(t.family, t.speedKmh)).groundGlow });
+      });
 
-    for (const t of targetsRef.current) {
-      if (!t.trajectory_arc || t.trajectory_arc.length < 2) continue;
-      if (progressOf(t, nowS) >= 1) continue;
-      const arc = t.trajectory_arc;
-      const f = Math.min(Math.max((nowS - t.start_time) / Math.max(t.eta_seconds, 1), 0), 1) * (arc.length - 1);
-      const lo = Math.floor(f);
-      const hi = Math.min(lo + 1, arc.length - 1);
-      const st = f - lo;
-      const p = map.project([
-        arc[lo][1] + (arc[hi][1] - arc[lo][1]) * st,
-        arc[lo][0] + (arc[hi][0] - arc[lo][0]) * st,
-      ]);
-      pts.push({ key: t.id, x: p.x, y: p.y });
-    }
-    for (const t of neptunRef.current) {
-      if (t.status !== 'active' || t.areaOnly) continue;
-      if (!t.expectedTrajectory || t.expectedTrajectory.length < 2) continue;
-      const p0 = predictNeptun(t, nowMs, neptunTimeRef.current.get(t.id) ?? null);
-      const p = map.project([p0.lon, p0.lat]);
-      pts.push({ key: `neptun-${t.id}`, x: p.x, y: p.y });
-    }
-
-    // Connected components within radius (union-find).
-    const parent = pts.map((_, i) => i);
-    const find = (a: number): number => {
-      while (parent[a] !== a) { parent[a] = parent[parent[a]]; a = parent[a]; }
-      return a;
+    const hashOf = (s: string): number => {
+      let h = 0;
+      for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) | 0;
+      return Math.abs(h);
     };
-    const R2 = CLUSTER_RADIUS_PX * CLUSTER_RADIUS_PX;
-    for (let i = 0; i < pts.length; i++) {
-      for (let j = i + 1; j < pts.length; j++) {
-        const dx = pts[i].x - pts[j].x;
-        const dy = pts[i].y - pts[j].y;
-        if (dx * dx + dy * dy <= R2) {
-          const ri = find(i);
-          const rj = find(j);
-          if (ri !== rj) parent[rj] = ri;
-        }
+
+    const prev = colorOverrideRef.current;
+    const next = new Map<string, string>();
+    const claimed = new Set<string>();
+    order.forEach((o) => {
+      const incumbent = prev.get(o.key) ?? o.base;
+      if (!claimed.has(incumbent)) {
+        claimed.add(incumbent);
+        // Plain base color needs no stored override; a still-unique
+        // overflow color is kept as is (stability, no flicker).
+        if (incumbent !== o.base) next.set(o.key, incumbent);
+        return;
       }
-    }
-    const groups = new Map<number, number[]>();
-    pts.forEach((_, i) => {
-      const r = find(i);
-      const g = groups.get(r);
-      if (g) g.push(i);
-      else groups.set(r, [i]);
+      // Collision: this full color is taken — first free overflow color.
+      const pick = OVERFLOW_PALETTE.find((p) => !claimed.has(p))
+        ?? OVERFLOW_PALETTE[hashOf(o.key) % OVERFLOW_PALETTE.length];
+      next.set(o.key, pick);
+      claimed.add(pick);
     });
 
-    const next = new Map<string, string>();
-    let groupNo = 0;
-    let total = 0;
-    const ordered = [...groups.values()].sort((a, b) => a[0] - b[0]);
-    for (const g of ordered) {
-      if (g.length <= CLUSTER_MIN_COUNT) continue;
-      groupNo++;
-      total += g.length;
-      g.forEach((pi, k) => {
-        // Stride by 4 so neighbouring bunches start on different colors.
-        next.set(pts[pi].key, CLUSTER_PALETTE[((groupNo - 1) * 4 + k) % CLUSTER_PALETTE.length]);
-      });
-    }
-
-    // Apply only on change (colors + membership signature).
-    const prev = clusterColorRef.current;
+    // Apply only on change.
     let same = prev.size === next.size;
     if (same) {
       next.forEach((c, k) => { if (prev.get(k) !== c) same = false; });
     }
     if (same) return;
-    clusterColorRef.current = next;
+    colorOverrideRef.current = next;
     arcsDirtyRef.current = true;
     pushGroundFeatures();
     pushNeptunTrajectories();
     htmlMarkersRef.current.forEach((m, id) => paintSimCluster(m, next.get(id) ?? null));
     neptunLiveRef.current.forEach((r, id) => paintNeptunCluster(r, next.get(`neptun-${id}`) ?? null));
-    setClusterMeta((m) => (m.groups === groupNo && m.total === total ? m : { groups: groupNo, total }));
   };
 
   // Marching-ants dash animation state for low-altitude trajectories.
@@ -477,7 +552,7 @@ export const TacticalMap: React.FC<TacticalMapProps> = ({
         const dimmed = is3D;
         const skin = skinOf(t.threat_type);
         // Swarm bunch: distinct color per track instead of the type palette.
-        const cc = clusterColorRef.current.get(t.id);
+        const cc = colorOverrideRef.current.get(t.id);
         return {
           type: 'Feature' as const,
           properties: {
@@ -612,6 +687,7 @@ export const TacticalMap: React.FC<TacticalMapProps> = ({
         rec.launchMarker?.remove();
         rec.destMarker?.remove();
         neptunLiveRef.current.delete(id);
+        liveFixRef.current.delete(id);
       }
     });
 
@@ -747,6 +823,13 @@ export const TacticalMap: React.FC<TacticalMapProps> = ({
             },
           },
           'neptun-trajectories': {
+            type: 'geojson',
+            data: {
+              type: 'FeatureCollection',
+              features: [],
+            },
+          },
+          'neptun-history': {
             type: 'geojson',
             data: {
               type: 'FeatureCollection',
@@ -903,6 +986,36 @@ export const TacticalMap: React.FC<TacticalMapProps> = ({
               'line-dasharray': [3, 2],
             },
           },
+          // NEPTUN history source (kept defined but empty: forecast only)
+          {
+            id: 'neptun-history-glow-layer',
+            type: 'line',
+            source: 'neptun-history',
+            layout: {
+              'line-cap': 'round',
+              'line-join': 'round',
+            },
+            paint: {
+              'line-color': ['coalesce', ['get', 'color'], '#38bdf8'],
+              'line-width': 6,
+              'line-blur': 3,
+              'line-opacity': 0.5,
+            },
+          },
+          {
+            id: 'neptun-history-core-layer',
+            type: 'line',
+            source: 'neptun-history',
+            layout: {
+              'line-cap': 'round',
+              'line-join': 'round',
+            },
+            paint: {
+              'line-color': ['coalesce', ['get', 'color'], '#38bdf8'],
+              'line-width': 2.5,
+              'line-opacity': 0.9,
+            },
+          },
         ],
       },
       center: [31.5, 49.5],
@@ -1004,6 +1117,10 @@ export const TacticalMap: React.FC<TacticalMapProps> = ({
       map.setPaintProperty('neptun-trajectories-glow-layer', 'line-opacity', dim ? 0.25 : 0.5);
       map.setPaintProperty('neptun-trajectories-core-layer', 'line-width', dim ? 1.5 : 2.5);
       map.setPaintProperty('neptun-trajectories-core-layer', 'line-opacity', dim ? 0.4 : 0.9);
+      map.setPaintProperty('neptun-history-glow-layer', 'line-width', dim ? 4 : 6);
+      map.setPaintProperty('neptun-history-glow-layer', 'line-opacity', dim ? 0.25 : 0.5);
+      map.setPaintProperty('neptun-history-core-layer', 'line-width', dim ? 1.5 : 2.5);
+      map.setPaintProperty('neptun-history-core-layer', 'line-opacity', dim ? 0.4 : 0.9);
     } catch {
       // Style/layers not ready yet — defaults in the style apply.
     }
@@ -1228,6 +1345,7 @@ export const TacticalMap: React.FC<TacticalMapProps> = ({
       const sinP = Math.sin(pitchRad);
       const zoom = map.getZoom();
       const nowS = Date.now() / 1000;
+      const nowMs = Math.round(nowS * 1000);
       const cache = arcCacheRef.current;
       cache.clear();
       for (const target of targetsRef.current) {
@@ -1260,7 +1378,7 @@ export const TacticalMap: React.FC<TacticalMapProps> = ({
         else if (target.threat_type === 'JET_SHAHED') { dash = [12, 6]; dashMult = 2.3; }
         else if (target.threat_type === 'CRUISE_MISSILE') { dash = [16, 9]; dashMult = 1.5; }
         else if (target.threat_type === 'RECON_UAV') { dash = [2, 7]; dashMult = 0.45; }
-        const cc = clusterColorRef.current.get(target.id);
+        const cc = colorOverrideRef.current.get(target.id);
         cache.set(target.id, { path, glow: cc ?? skin.overlayGlow, core: cc ? '#f8fafc' : skin.overlayCore, dash, dashMult });
       }
       // NEPTUN live tracks: same lifted treatment as simulation arcs.
@@ -1269,8 +1387,15 @@ export const TacticalMap: React.FC<TacticalMapProps> = ({
       // flown fraction so apogee lands mid-flight.
       for (const nt of neptunRef.current) {
         if (nt.status !== 'active' || nt.areaOnly) continue;
-        const traj = nt.expectedTrajectory;
+        let traj: number[][] | undefined = nt.expectedTrajectory;
         if (!traj || traj.length < 2) continue;
+        // Same live-anchor shift as the ground push, from the shared clock.
+        {
+          const live = liveFixRef.current.get(nt.id)
+            ?? predictNeptun(nt, nowMs, neptunTimeRef.current.get(nt.id) ?? null);
+          const sh = neptunShift(nt, live);
+          if (sh.dLa !== 0 || sh.dLo !== 0) traj = shiftTraj(traj, sh.dLa, sh.dLo);
+        }
         const key = neptunLiftKey(nt.family, nt.speedKmh);
         // In 2D the ground GeoJSON line already shows lifted types 1:1.
         if (!in3D && (key === 'BALLISTIC' || key === 'KAB')) continue;
@@ -1288,9 +1413,10 @@ export const TacticalMap: React.FC<TacticalMapProps> = ({
           else path.lineTo(p.x, p.y - yOff);
         }
         const { dash, dashMult } = neptunDashFor(key);
-        const cc = clusterColorRef.current.get(`neptun-${nt.id}`);
+        const cc = colorOverrideRef.current.get(`neptun-${nt.id}`);
         cache.set(`neptun-${nt.id}`, { path, glow: cc ?? skin.overlayGlow, core: cc ? '#f8fafc' : skin.overlayCore, dash, dashMult });
       }
+      // NOTE: flown history is intentionally not drawn — forecast only.
       arcsDirtyRef.current = false;
     };
 
@@ -1304,7 +1430,9 @@ export const TacticalMap: React.FC<TacticalMapProps> = ({
       const w = parent ? parent.clientWidth : canvas.clientWidth;
       const h = parent ? parent.clientHeight : canvas.clientHeight;
       if (w < 1 || h < 1) return false;
-      const dpr = Math.min(window.devicePixelRatio || 1, 2);
+      // Low mode renders at dpr 1: quarter pixels to stroke when crowded.
+      const dprCap = perfModeRef.current === 0 ? 1 : 2;
+      const dpr = Math.min(window.devicePixelRatio || 1, dprCap);
       const prev = canvasSizeRef.current;
       if (prev.w !== w || prev.h !== h || (canvas as any)._dpr !== dpr) {
         prev.w = w;
@@ -1321,6 +1449,11 @@ export const TacticalMap: React.FC<TacticalMapProps> = ({
       const canvas = arcCanvasRef.current;
       const map = mapRef.current;
       if (!canvas || !map) return;
+      // Adaptive frame skipping: full rate only when few tracks are live.
+      // Skipped frames keep the previous canvas content (no clear).
+      const perfMode = perfModeRef.current;
+      if (perfMode === 1 && (frameRef.current % 2 === 1)) return;
+      if (perfMode === 0 && (frameRef.current % 3 !== 0)) return;
       if (!syncCanvasSize()) return;
       const { w: W, h: H } = canvasSizeRef.current;
       const ctx = canvas.getContext('2d');
@@ -1338,16 +1471,19 @@ export const TacticalMap: React.FC<TacticalMapProps> = ({
         // Outer neon glow + bright core — same palette/widths as before.
         // No shadowBlur: the wide glow pass already renders the halo at a
         // fraction of the GPU cost. Visually identical at these widths.
-        ctx.save();
-        ctx.globalAlpha = 0.4;
-        ctx.strokeStyle = e.glow;
-        ctx.lineWidth = 9;
-        ctx.lineCap = 'round';
-        ctx.lineJoin = 'round';
-        ctx.setLineDash(e.dash);
-        ctx.lineDashOffset = dashOff;
-        ctx.stroke(e.path);
-        ctx.restore();
+        // Low mode skips the 9px glow pass (core only) when crowded.
+        if (perfMode !== 0) {
+          ctx.save();
+          ctx.globalAlpha = 0.4;
+          ctx.strokeStyle = e.glow;
+          ctx.lineWidth = 9;
+          ctx.lineCap = 'round';
+          ctx.lineJoin = 'round';
+          ctx.setLineDash(e.dash);
+          ctx.lineDashOffset = dashOff;
+          ctx.stroke(e.path);
+          ctx.restore();
+        }
         ctx.save();
         ctx.globalAlpha = 0.95;
         ctx.strokeStyle = e.core;
@@ -1369,6 +1505,27 @@ export const TacticalMap: React.FC<TacticalMapProps> = ({
       const pitchRad = map ? (map.getPitch() * Math.PI) / 180 : 0;
       const sinP = Math.sin(pitchRad);
       const zoom = map ? map.getZoom() : 6;
+      // Padded viewport bounds (once per frame) for marker culling:
+      // off-screen tracks skip all per-frame DOM writes when crowded.
+      let cullW = 0;
+      let cullE = 0;
+      let cullS = 0;
+      let cullN = 0;
+      let cullOn = false;
+      if (map) {
+        try {
+          const b = map.getBounds();
+          const sw = b.getSouthWest();
+          const ne = b.getNorthEast();
+          const padLon = (ne.lng - sw.lng) * 0.25;
+          const padLat = (ne.lat - sw.lat) * 0.25;
+          cullW = sw.lng - padLon;
+          cullE = ne.lng + padLon;
+          cullS = sw.lat - padLat;
+          cullN = ne.lat + padLat;
+          cullOn = true;
+        } catch { /* map torn down */ }
+      }
 
       tList.forEach((target) => {
         const markers = htmlMarkersRef.current.get(target.id);
@@ -1416,6 +1573,21 @@ export const TacticalMap: React.FC<TacticalMapProps> = ({
         if (arrivedRef.current.has(target.id)) arrivedRef.current.delete(target.id);
         if (mEl) mEl.style.display = '';
         if (bMarkerEl) bMarkerEl.style.display = '';
+
+        // Viewport culling: park off-screen markers (skip every DOM write).
+        if (cullOn && (currLon < cullW || currLon > cullE || currLat < cullS || currLat > cullN)) {
+          if (!markers.culled) {
+            markers.culled = true;
+            if (mEl) mEl.style.display = 'none';
+            if (bMarkerEl) bMarkerEl.style.display = 'none';
+          }
+          return;
+        }
+        if (markers.culled) {
+          markers.culled = false;
+          if (mEl) mEl.style.display = '';
+          if (bMarkerEl) bMarkerEl.style.display = '';
+        }
 
         markers.missileMarker.setLngLat([currLon, currLat]);
 
@@ -1472,12 +1644,28 @@ export const TacticalMap: React.FC<TacticalMapProps> = ({
       lastTickRef.current = now;
       dashOffRef.current = (dashOffRef.current + dt * 42) % 2000;
 
-      // Swarm disambiguation at ~2Hz (every 30th frame).
+      // Per-track colors + NEPTUN line refresh at ~2Hz (every 30th frame).
+      // Lines follow live fixes; colors are persistent (no zoom flicker).
       frameRef.current += 1;
-      if (frameRef.current % 30 === 0) updateClusters();
+      if (frameRef.current % 30 === 0) {
+        assignTrackColors();
+        pushNeptunTrajectories();
+        arcsDirtyRef.current = true;
+        // Adaptive quality follows the live-track count.
+        let liveCount = 0;
+        for (const t of targetsRef.current) {
+          if (t.trajectory_arc && t.trajectory_arc.length >= 2) liveCount++;
+        }
+        for (const t of neptunRef.current) {
+          if (t.status === 'active' && !t.areaOnly && t.expectedTrajectory && t.expectedTrajectory.length >= 2) liveCount++;
+        }
+        perfModeRef.current = liveCount > 30 ? 0 : liveCount > 12 ? 1 : 2;
+      }
 
-      // NEPTUN live markers: dead-reckoned positions every frame + 3D lift
-      // along the displayed arc (same model as simulation targets).
+      // NEPTUN live markers: dead-reckoned fix snapped onto the displayed
+      // arc (like simulation targets, whose position always comes from the
+      // arc) + 3D lift along it. Without the snap the marker drifts off
+      // its line whenever reported heading differs from the drawn track.
       {
         const nowMs = Date.now();
         const mapBearing = map ? (map.getBearing() ?? 0) : 0;
@@ -1487,29 +1675,50 @@ export const TacticalMap: React.FC<TacticalMapProps> = ({
         neptunRef.current.forEach((t) => {
           const rec = neptunLiveRef.current.get(t.id);
           if (!rec) return;
-          const p = predictNeptun(t, nowMs, neptunTimeRef.current.get(t.id) ?? null);
+          const raw = predictNeptun(t, nowMs, neptunTimeRef.current.get(t.id) ?? null);
+          // Same shift the drawn arcs got, so the marker lands exactly on
+          // the displayed (shifted) line, not on the fetch-time one.
+          const sh = neptunShift(t, raw);
+          let mLat = raw.lat;
+          let mLon = raw.lon;
+          let frac: number | null = null;
+          const fwd = t.expectedTrajectory;
+          if (!t.areaOnly && fwd && fwd.length >= 2) {
+            const sn = snapToTraj(raw.lat, raw.lon, fwd);
+            if (sn) {
+              frac = sn.frac;
+              const pp = pointAtFrac(fwd, sn.frac);
+              mLat = pp.lat + sh.dLa;
+              mLon = pp.lon + sh.dLo;
+            }
+          }
+          // Shared clock: raw live fix for ground/overlay anchoring.
+          liveFixRef.current.set(t.id, { lat: raw.lat, lon: raw.lon });
+          // Viewport culling: park off-screen markers (skip every DOM write).
+          if (cullOn && (mLon < cullW || mLon > cullE || mLat < cullS || mLat > cullN)) {
+            if (!rec.culled) {
+              rec.culled = true;
+              const rootEl = rec.marker.getElement() as HTMLElement | null;
+              if (rootEl) rootEl.style.display = 'none';
+            }
+            return;
+          }
+          if (rec.culled) {
+            rec.culled = false;
+            const rootEl = rec.marker.getElement() as HTMLElement | null;
+            if (rootEl) rootEl.style.display = '';
+          }
           try {
-            rec.marker.setLngLat([p.lon, p.lat]);
+            rec.marker.setLngLat([mLon, mLat]);
           } catch { /* torn down */ }
           if (t.areaOnly) return;
           const key = neptunLiftKey(t.family, t.speedKmh);
-          const traj = t.expectedTrajectory;
-          // Progress of the dead-reckoned fix along the forward arc,
-          // mapped to full-flight progress for the altitude profile.
-          let prog = neptunProgress(t, 0);
-          let nearIdx = -1;
-          if (traj && traj.length >= 2) {
-            let best = Infinity;
-            for (let i = 0; i < traj.length; i++) {
-              const dLa = traj[i][0] - p.lat;
-              const dLo = traj[i][1] - p.lon;
-              const d = dLa * dLa + dLo * dLo;
-              if (d < best) { best = d; nearIdx = i; }
-            }
-            prog = neptunProgress(t, nearIdx / (traj.length - 1));
-          }
+          const traj = fwd;
+          // Progress of the snapped fix along the forward arc, mapped to
+          // full-flight progress for the altitude profile.
+          const prog = neptunProgress(t, frac ?? 0);
           const yOffHere = liftable
-            ? ((visualAltAt(prog, key) / mpp(p.lat)) * sinP * ALT_PX_EXAGGERATION)
+            ? ((visualAltAt(prog, key) / mpp(mLat)) * sinP * ALT_PX_EXAGGERATION)
             : 0;
           try {
             rec.marker.setOffset([0, -yOffHere]);
@@ -1517,14 +1726,15 @@ export const TacticalMap: React.FC<TacticalMapProps> = ({
           const rotor = rec.rotorEl;
           if (!rotor) return;
           // Nose along the VISIBLE (lifted) tangent like simulation icons.
-          if (map && traj && traj.length >= 2 && nearIdx >= 0) {
-            const nxtIdx = Math.min(nearIdx + 2, traj.length - 1);
+          if (map && traj && traj.length >= 2 && frac != null) {
+            const fi = frac * (traj.length - 1);
+            const nxtIdx = Math.min(Math.floor(fi) + 2, traj.length - 1);
             const nxt = traj[nxtIdx];
             const progN = neptunProgress(t, nxtIdx / (traj.length - 1));
             const yOffNext = liftable
               ? ((visualAltAt(progN, key) / mpp(nxt[0])) * sinP * ALT_PX_EXAGGERATION)
               : 0;
-            const pc = map.project([p.lon, p.lat]);
+            const pc = map.project([mLon, mLat]);
             const pn = map.project([nxt[1], nxt[0]]);
             const dx = pn.x - pc.x;
             const dy = (pn.y - yOffNext) - (pc.y - yOffHere);
@@ -1533,8 +1743,8 @@ export const TacticalMap: React.FC<TacticalMapProps> = ({
               return;
             }
           }
-          if (p.heading != null) {
-            rotor.style.transform = `rotate(${(((p.heading - mapBearing) % 360 + 360) % 360).toFixed(0)}deg)`;
+          if (raw.heading != null) {
+            rotor.style.transform = `rotate(${(((raw.heading - mapBearing) % 360 + 360) % 360).toFixed(0)}deg)`;
           }
         });
       }
@@ -1604,11 +1814,6 @@ export const TacticalMap: React.FC<TacticalMapProps> = ({
             Дані загроз: NEPTUN
           </a>
         </div>
-        {clusterMeta.groups > 0 && (
-          <div className="text-fuchsia-300 text-[10px] pt-0.5 mt-0.5 border-t border-slate-800">
-            🎨 Розрізнення зграї: {clusterMeta.total} цілей у {clusterMeta.groups} гр. — кожна своїм кольором
-          </div>
-        )}
       </div>
     </div>
   );
